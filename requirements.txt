@@ -1,0 +1,5 @@
+spotipy>=2.23.0
+requests>=2.31.0
+mutagen>=1.47.0
+rich>=13.7.0
+configparser>=5.3.0
