@@ -140,7 +140,7 @@ python spytorec.py test-auth
 | "Device not found"          | Run `list-devices` and use the full audio device name              |
 | Beginning cut off           | Lower `--interval` (e.g. 0.3 or 0.2)                               |
 | Corrupted duration          | Ensure `ffmpeg` finalizer runs successfully                       |
-| Ads in recording            | Use Spotify Premium                                                |
+| Ads in recording            | Use Spotify Premium  (eventhough Ads won't recorded in Free Subscriptions)                                              |
 
 ---
 
