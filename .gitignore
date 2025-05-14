@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.env
+*.env
+env/
+venv/
+ENV/
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.manifest
+*.spec
+# SpytoRec specific
+config.ini # Users should create their own, or it's created interactively
+Recordings/ # Users' output directory, should not be in repo
+spytorec_metadata.jsonl # Log file, specific to user's recordings
+*.rewrite_temp # Temporary files from rewrite process
+*_cover.jpg # Temporary cover art files
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
