@@ -153,7 +153,7 @@ Fork the repo, give it a star, and help build more useful tools for personal mus
 
 ## 📜 License
 
-This project is licensed under **Creative Commons BY-NC 4.0**  
+This project is licensed under **MIT License**  
 See [LICENSE](LICENSE) for details.
 
 ---
