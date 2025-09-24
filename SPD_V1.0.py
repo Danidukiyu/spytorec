@@ -326,9 +326,6 @@ def finalization_worker_function(ffmpeg_exe_cfg: str, log_file_path_global: Path
             
             if proc.poll() is None: 
                 try:
-                    if proc.stdin and not proc.stdin.closed:
-                        try: proc.stdin.close() 
-                        except Exception: pass 
                     _, stderr_b = proc.communicate(timeout=20) 
                     exit_c = proc.returncode
                     graceful_stop_by_q = task.get('q_sent_by_main', False) and (exit_c == 0 or exit_c == 255)
