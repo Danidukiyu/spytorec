@@ -394,7 +394,7 @@ def finalization_worker_function(ffmpeg_exe_cfg: str, log_file_path_global: Path
         except queue.Empty:
             if stop_worker_event.is_set() and finalization_task_queue.empty(): break
         except Exception as e:
-            console.print(f"[bold red][Worker] Critical Error in finalization loop: {e}\n{escape(traceback.format_exc())}[/red]")
+            console.print(f"[bold red][Worker] Critical Error in finalization loop: {e}\n{escape(traceback.format_exc())}[/bold red]")
             try: finalization_task_queue.task_done() 
             except ValueError: pass 
 
