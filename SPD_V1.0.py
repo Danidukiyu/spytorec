@@ -53,6 +53,7 @@ import configparser
 # --- Constants ---
 SCRIPT_VERSION = "1.2" # Script version, keep in sync with argparse
 SPOTIPY_REDIRECT_URI = 'http://127.0.0.1:8888/callback'
+SPOTIPY_SCOPE = "user-read-playback-state user-read-currently-playing user-modify-playback-state"
 console = Console()
 current_ffmpeg_process = None
 current_recording_info = {}
@@ -526,7 +527,7 @@ def execute_test_auth_command(args_test_auth: argparse.Namespace, config_obj: co
         client_id, client_secret = get_spotify_credentials() 
         sp = Spotify(auth_manager=SpotifyOAuth(
             client_id=client_id, client_secret=client_secret,
-            redirect_uri=SPOTIPY_REDIRECT_URI, scope="user-read-playback-state user-read-currently-playing",
+            redirect_uri=SPOTIPY_REDIRECT_URI, scope=SPOTIPY_SCOPE,
             open_browser=False, requests_timeout=10 
         ))
         user = sp.current_user()
@@ -573,7 +574,7 @@ def execute_record_command(args: argparse.Namespace, config_obj: configparser.Co
         client_id, client_secret = get_spotify_credentials()
         sp = Spotify(auth_manager=SpotifyOAuth(
             client_id=client_id, client_secret=client_secret, redirect_uri=SPOTIPY_REDIRECT_URI,
-            scope="user-read-playback-state user-read-currently-playing", open_browser=True, requests_timeout=15
+            scope=SPOTIPY_SCOPE, open_browser=True, requests_timeout=15
         ))
         user = sp.current_user() 
         if not user or not user.get('display_name'):
@@ -611,7 +612,8 @@ def execute_record_command(args: argparse.Namespace, config_obj: configparser.Co
                     current_track_id = spotify_info['id']; current_track_name = spotify_info['name']
                     current_status_message = f"Detected: [cyan]{spotify_info['artist_str']} - {current_track_name}[/cyan]"
                     if current_track_id in persisted_recorded_ids or current_track_id in session_attempted_ids:
-                        current_status_message = f"[grey50]Skipping '{current_track_name}' (already handled/logged).[/grey50]"
+                        console.print(f"[grey50]Skipping '{current_track_name}' (already handled/logged).[/grey50]")
+                        sp.next_track()
                     else:
                         # Determine potential full path for skip check based on organization flag
                         file_name_part_for_check = generate_safe_filename(spotify_info['artist_str'], spotify_info['name'], args.format)
