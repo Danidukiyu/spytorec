@@ -1,770 +1,1377 @@
 #!/usr/bin/env python3
-# -----------------------------------------------------------------------------
-# SpytoRec - Spotify Track Recorder
-#
-# Author: @Darkphoenix
-# GitHub: https://github.com/Danidukiyu
-# Version: 1.2 
-#
-# Description:
-#   A Python script to record currently playing Spotify tracks with high
-#   accuracy. It automatically splits tracks, embeds metadata (title, artist,
-#   album, cover art), and can organize recordings into an Artist/Album
-#   directory structure. Features a configuration file for defaults,
-#   interactive API key setup, asynchronous finalization for responsiveness,
-#   audio header rewriting for player compatibility, and various command-line
-#   options and subcommands for customization and utility.
-#
-# License:
-#   This project is licensed under the MIT License.
-#   Refer to the LICENSE file in the repository for full details.
-#
-# Disclaimer:
-#   This script is intended for personal, private use only. Users are solely
-#   responsible for ensuring their use complies with all applicable laws and
-#   Spotify's Terms of Service regarding content recording.
-# -----------------------------------------------------------------------------
+"""
+SpytoRec V8.0.0
+================================================================================
+WHAT IT DOES:
+    Records Spotify audio streams in real-time to high-quality FLAC files with
+    automatic track detection, file tagging, and album art embedding.
+
+KEY FUNCTIONS:
+    • Automatically detects when Spotify starts/stops playing
+    • Records each track as a separate FLAC file
+    • Tags files with artist, album, title, track number, and year
+    • Downloads and embeds album artwork
+    • Real-time audio level meters with clipping detection
+    • Auto-switches recording between tracks seamlessly
+    • Monitors audio health (stereo/mono, signal strength)
+    • Recovers from errors automatically
+    • Cross-platform (Windows/Linux/macOS)
+
+TECHNICAL HIGHLIGHTS:
+    • Uses FFmpeg for high-quality FLAC encoding (16/24/32-bit, up to 96kHz)
+    • Spotify API for track metadata and playback state
+    • Real-time audio analysis with sounddevice
+    • Rich terminal UI with live meters and progress bars
+    • Thread-safe state machine with error recovery
+    • Watchdog monitoring for process health
+
+REMOVED (for stability):
+    • BPM/Key analysis (was unstable)
+    • MusicBrainz metadata (unreliable)
+    • DSP analysis threads (performance overhead)
+
+Author: @Darkphoenix
+GitHub: https://github.com/Danidukiyu
+Version: 8.0.0
+
+Contributors:
+    • @electrodics-ship-it — contributed the V8.0.0 optimized build (issue #6):
+      real-time audio metering, state machine, watchdog, rotating logs,
+      24-bit FLAC support, and cross-platform improvements.
+
+License:
+    This project is licensed under the MIT License.
+    Refer to the LICENSE file in the repository for full details.
+
+Disclaimer:
+    This script is intended for personal, private use only. Users are solely
+    responsible for ensuring their use complies with all applicable laws and
+    Spotify's Terms of Service regarding content recording.
+"""
 
 import os
+import sys
 import time
 import argparse
 import subprocess
-import requests
-import json
-import sys
-import re 
-from datetime import datetime, timezone
-from pathlib import Path
-from mutagen.oggvorbis import OggVorbis
-from mutagen.flac import FLAC, Picture
-from spotipy import Spotify
-from spotipy.oauth2 import SpotifyOAuth
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
-from rich.markup import escape
-from rich.prompt import Prompt
-from rich.table import Table 
-import traceback
-import queue 
+import re
+import queue
 import threading
-import configparser 
+import configparser
+import requests
+import logging
+import platform
+import signal
+import atexit
+from contextlib import contextmanager
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Optional, Dict, Any, Tuple, List, Union
 
-# --- Constants ---
-SCRIPT_VERSION = "1.2" # Script version, keep in sync with argparse
-SPOTIPY_REDIRECT_URI = 'http://127.0.0.1:8888/callback'
-SPOTIPY_SCOPE = "user-read-playback-state user-read-currently-playing user-modify-playback-state"
-console = Console()
-current_ffmpeg_process = None
-current_recording_info = {}
-finalization_task_queue = queue.Queue()
-stop_worker_event = threading.Event()
-CONFIG_FILE_NAME = "config.ini"
-CONFIG_FILE_PATH = Path(__file__).resolve().parent / CONFIG_FILE_NAME
+# --- Dependency Check ---
+try:
+    import sounddevice as sd
+    import numpy as np
+    from mutagen.flac import FLAC, Picture
+    from spotipy import Spotify
+    from spotipy.oauth2 import SpotifyOAuth
+    from spotipy.exceptions import SpotifyException
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.live import Live
+    from rich.table import Table
+    from rich.progress_bar import ProgressBar
+    from rich.spinner import Spinner
+except ImportError as e:
+    print(f"CRITICAL: Missing library: {e}\nPlease install required packages: pip install sounddevice numpy mutagen spotipy rich requests")
+    sys.exit(1)
 
-# --- Intro Banner ---
-def display_intro_banner():
-    console.print(Panel(
-        Text.from_markup(
-            f"[bold sky_blue1]SpytoRec - Spotify Track Recorder[/bold sky_blue1]\n"
-            f"Developed by: [bold magenta]@Darkphoenix[/bold magenta]\n"
-            f"GitHub: [link=https://github.com/Danidukiyu]https://github.com/Danidukiyu[/link]\n"
-            f"Version: {SCRIPT_VERSION}"
-        ),
-        title="[white]Welcome[/white]",
-        border_style="magenta",
-        expand=False,
-        padding=(1, 2)
-    ))
-    console.print() # Add a blank line after the banner
-
-# --- Legal Disclaimer (Printed to console) ---
-DISCLAIMER_TEXT = """
-[bold red]Disclaimer:[/bold red]
-This script is intended for personal, private use only.
-Recording copyrighted material from streaming services may violate their Terms of Service
-and/or copyright laws in your country. Users are solely responsible for ensuring their use
-of this script complies with all applicable laws and terms of service.
-The developers of this script assume no liability for any misuse.
-
-[bold yellow]Recommendation:[/bold yellow] For best results, please ensure 'Crossfade songs'
-and 'Automix' are DISABLED in your Spotify client's playback settings.
-"""
-
-def display_disclaimer():
-    console.print(Panel(Text.from_markup(DISCLAIMER_TEXT), title="[bold yellow]Important Notice[/bold yellow]", border_style="yellow", expand=False))
-    console.print("")
-
-# --- Credential and Config Handling ---
-def _create_template_config(config_path: Path):
-    console.print(f"[yellow]Creating template configuration file at: {config_path}[/yellow]")
-    config = configparser.ConfigParser(allow_no_value=True) 
-    config['SpotifyAPI'] = {
-        'SPOTIPY_CLIENT_ID': 'YOUR_CLIENT_ID_HERE',
-        'SPOTIPY_CLIENT_SECRET': 'YOUR_CLIENT_SECRET_HERE',
-        '# Instructions:': None,
-        '# 1. Replace YOUR_CLIENT_ID_HERE and YOUR_CLIENT_SECRET_HERE with your actual credentials.': None,
-    }
-    config['GeneralSettings'] = {
-        '# Instructions: Uncomment (remove "#") and edit values below to set your preferred defaults.': None,
-        '# output_directory': 'Recordings',
-        '# default_format': 'flac',
-        '# default_quality_ogg': '7',
-        '# polling_interval_seconds': '0.5',
-        '# audio_device': 'audio=CABLE Output (VB-Audio Virtual Cable) ; For Windows. Mac/Linux users: see --help for device info',
-        '# ffmpeg_path': 'ffmpeg',
-        '# min_duration_seconds': '25',
-        '# recording_buffer_seconds': '-0.2',
-        '# skip_existing_file': 'false',
-        '# organize_by_artist_album': 'false  (true or false, creates Artist/Album/track.flac structure)'
-    }
+# Platform-specific imports
+if os.name == 'nt':
+    import msvcrt
     try:
-        with open(config_path, 'w', encoding='utf-8') as configfile: config.write(configfile)
-        console.print(f"[green]Template config file '{config_path.name}' created.[/green]")
-        console.print(f"[bold yellow]PLEASE EDIT this file with your Spotify API credentials (under [SpotifyAPI]) and then re-run the script.[/bold yellow]")
-    except OSError as e:
-        console.print(f"[red]Error creating template config file '{config_path.name}': {e}[/red]")
+        import win32file
+        import win32con
+        import pywintypes
+        HAS_WIN32 = True
+    except ImportError:
+        HAS_WIN32 = False
+else:
+    import fcntl
+    import termios
+    import tty
+    import select
+    HAS_WIN32 = False
 
-def get_spotify_credentials():
-    client_id_env = os.environ.get('SPOTIPY_CLIENT_ID')
-    client_secret_env = os.environ.get('SPOTIPY_CLIENT_SECRET')
-    if client_id_env and client_secret_env:
-        console.print("[grey50]Using Spotify credentials from environment variables.[/grey50]")
-        return client_id_env, client_secret_env
-    config = configparser.ConfigParser(allow_no_value=True)
-    ask_user_for_creds = False
+# --- Global Constants ---
+SCRIPT_VERSION = "8.0.0"
+SPOTIPY_REDIRECT_URI = 'http://127.0.0.1:8888/callback'
+SPOTIPY_SCOPE = "user-read-playback-state user-read-currently-playing"
+AUDIO_THRESHOLD = 0.0001
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_FILE_PATH = BASE_DIR / "config.ini"
+LOCK_FILE_PATH = BASE_DIR / "spyto.lock"
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0
+HEARTBEAT_TIMEOUT = 5.0
+MAX_COVER_ART_BYTES = 2 * 1024 * 1024  # 2 MB safety cap for album art
+
+console = Console()
+
+# --- Internal State Machine Definitions ---
+STATE_INIT = "INITIALISING"
+STATE_IDLE = "IDLE"
+STATE_MONITORING = "MONITORING"
+STATE_RECORDING = "RECORDING"
+STATE_SWITCHING = "SWITCHING_TRACK"
+STATE_STOPPING = "STOPPING"
+STATE_ERROR = "ERROR"
+STATE_RECOVERING = "RECOVERING"
+
+VALID_STATE_TRANSITIONS = {
+    STATE_INIT: {STATE_IDLE, STATE_ERROR},
+    STATE_IDLE: {STATE_MONITORING, STATE_ERROR},
+    STATE_MONITORING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR},
+    STATE_RECORDING: {STATE_SWITCHING, STATE_STOPPING, STATE_ERROR, STATE_RECOVERING},
+    STATE_SWITCHING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR},
+    STATE_STOPPING: {STATE_IDLE, STATE_ERROR},
+    STATE_ERROR: {STATE_RECOVERING, STATE_IDLE},
+    STATE_RECOVERING: {STATE_IDLE, STATE_MONITORING, STATE_ERROR}
+}
+
+# --- Thread-Safe Shared State ---
+state_lock = threading.Lock()
+meter_lock = threading.Lock()
+current_state = STATE_INIT
+last_error_msg = ""
+failed_recordings = []
+error_count = 0
+last_heartbeat = time.time()
+
+# Audio Telemetry Globals
+meter_data = {}
+meter_peaks = {}
+live_rms_l, live_rms_r = 0.0, 0.0
+peak_l, peak_r = 0.0, 0.0
+raw_l, raw_r = 0.0, 0.0
+smoothed_rms_l, smoothed_rms_r = 0.0, 0.0
+mono_warning_frames = 0
+
+# Queues
+metadata_queue = queue.Queue()
+stop_event = threading.Event()
+
+# Process & Stream References
+watchdog_proc_ref = None
+watchdog_file_ref = None
+active_monitor_stream = None
+current_track_id_ref = None
+ffmpeg_process = None
+ffmpeg_lock = threading.Lock()
+
+# --- Platform detection for FFmpeg input format ---
+def get_ffmpeg_input_format() -> str:
+    """Returns the correct FFmpeg audio input format for the current platform."""
+    if os.name == 'nt':
+        return 'dshow'
+    elif sys.platform == 'darwin':
+        return 'avfoundation'
+    else:
+        return 'pulse'
+
+def get_ffmpeg_device_arg(device_name: str) -> str:
+    """Returns the correctly formatted device argument for the current platform."""
+    if os.name == 'nt':
+        return f"audio={device_name}"
+    elif sys.platform == 'darwin':
+        return device_name
+    else:
+        return device_name
+
+
+
+# --- Context Managers for Resource Management ---
+
+@contextmanager
+def file_lock(lock_path: Path, timeout: float = 5.0):
+    """Cross-platform file locking context manager. Degrades gracefully if locking is unavailable."""
+    lock_file = None
+    locked = False
+    try:
+        if os.name == 'nt' and HAS_WIN32:
+            lock_file = open(lock_path, 'w')
+            try:
+                win32file.LockFileEx(
+                    win32file._get_osfhandle(lock_file.fileno()),
+                    win32con.LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    -0x10000,
+                    pywintypes.OVERLAPPED()
+                )
+                locked = True
+            except Exception as lock_err:
+                logging.warning(f"File locking (Win32) failed: {lock_err}")
+        elif os.name != 'nt':
+            lock_file = open(lock_path, 'w')
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except Exception as lock_err:
+                logging.warning(f"File locking (fcntl) failed: {lock_err}")
+
+        yield
+
+    finally:
+        if lock_file:
+            try:
+                if locked:
+                    if os.name == 'nt' and HAS_WIN32:
+                        try:
+                            win32file.UnlockFileEx(
+                                win32file._get_osfhandle(lock_file.fileno()),
+                                0,
+                                -0x10000,
+                                pywintypes.OVERLAPPED()
+                            )
+                        except Exception:
+                            pass
+                    elif os.name != 'nt':
+                        try:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                lock_file.close()
+            except Exception:
+                pass
+
+
+# --- 1. CONFIGURATION & LOGGING ---
+
+DEFAULT_CONFIG = {
+    'Recording': {
+        'device_id': '', 'ffmpeg_name': '', 'sample_rate': '48000', 'bit_depth': '24',
+        'channels': '2', 'output_format': 'flac', 'output_directory': 'Recordings',
+        'auto_start': 'false', 'overwrite_existing': 'false', 'force_safe_mode': 'false',
+        'max_retries': '3', 'retry_delay': '1'
+    },
+    'QualityDisplay': {
+        'show_sample_rate': 'true', 'show_bit_depth': 'true', 'show_channels': 'true',
+        'show_lr_meters': 'true', 'show_peak_hold': 'true'
+    },
+    'UIOptions': {
+        'show_analysis_status': 'false'
+    },
+    'Diagnostics': {
+        'enable_logging': 'true', 'log_level': 'info', 'log_file': 'spyto_system.log',
+        'ffmpeg_log_file': 'spyto_ffmpeg.log', 'max_log_size_mb': '5', 'log_analysis': 'false',
+        'clear_log_on_startup': 'false'
+    },
+    'UI': {
+        'theme': 'dark', 'show_status_strip': 'true', 'show_file_path': 'true',
+        'smooth_meter_animation': 'true'
+    },
+    'SafetyChecks': {
+        'validate_device': 'true', 'validate_output_path': 'true', 'validate_stereo': 'true',
+        'validate_encoder': 'true', 'validate_file_integrity': 'true'
+    },
+    'Debug': {
+        'show_debug_overlay': 'false', 'watchdog_enabled': 'true'
+    },
+    'Naming': {
+        'naming_format': '{track_no}. {artist} - {title}'
+    },
+    'SpotifyAPI': {
+        'SPOTIPY_CLIENT_ID': '', 'SPOTIPY_CLIENT_SECRET': ''
+    }
+}
+
+
+def resolve_path(path_str: Union[str, Path]) -> Path:
+    """Ensures all paths are absolute and relative to the script directory.
+    Returns a resolved absolute path; relative inputs are anchored to BASE_DIR.
+    """
+    p = Path(path_str) if not isinstance(path_str, Path) else path_str
+    resolved = p if p.is_absolute() else BASE_DIR / p
+    return resolved.resolve()
+
+
+def load_config() -> configparser.ConfigParser:
+    """Loads config.ini with validation and auto-populates missing defaults."""
+    cfg = configparser.ConfigParser()
+
     if CONFIG_FILE_PATH.exists():
         try:
-            config.read(CONFIG_FILE_PATH, encoding='utf-8') 
-            if config.has_section('SpotifyAPI'):
-                cid = config.get('SpotifyAPI', 'SPOTIPY_CLIENT_ID', fallback=None)
-                cs = config.get('SpotifyAPI', 'SPOTIPY_CLIENT_SECRET', fallback=None)
-                if cid and cid not in ['YOUR_CLIENT_ID_HERE', ''] and cs and cs not in ['YOUR_CLIENT_SECRET_HERE', '']:
-                    console.print(f"[grey50]Using Spotify credentials from '{CONFIG_FILE_PATH.name}'.[/grey50]")
-                    return cid, cs
-                else: ask_user_for_creds = True; console.print(f"[yellow]Config '{CONFIG_FILE_PATH.name}' has placeholder/missing API keys.[/yellow]")
-            else: ask_user_for_creds = True; console.print(f"[yellow]Section [SpotifyAPI] missing in '{CONFIG_FILE_PATH.name}'.[/yellow]")
-        except configparser.Error as e:
-            ask_user_for_creds = True; console.print(f"[red]Error reading '{CONFIG_FILE_PATH.name}': {e}. Reconfigure.[/red]")
-            config = configparser.ConfigParser(allow_no_value=True)
-    else: ask_user_for_creds = True; console.print(f"[yellow]Config file '{CONFIG_FILE_PATH.name}' not found.[/yellow]")
+            cfg.read(CONFIG_FILE_PATH, encoding='utf-8')
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not read config file: {e}[/yellow]")
 
-    if ask_user_for_creds:
-        if not CONFIG_FILE_PATH.exists(): 
-            _create_template_config(CONFIG_FILE_PATH)
-            console.print(f"[bold yellow]Template '{CONFIG_FILE_NAME}' created. Please edit it with your credentials and re-run, or provide them now.[/bold yellow]")
-            
-        console.print(Panel(
-            "To use this script, you need Spotify API credentials (Client ID & Secret).\n"
-            "These will be saved to a configuration file named '[bold cyan]config.ini[/bold cyan]' in the same directory as the script.\n\n"
-            "[green]Steps to get credentials:[/green]\n"
-            "1. Go to the Spotify Developer Dashboard: [link=dashboard.spotify.com]dashboard.spotify.com[/link]\n"
-            "2. Log in and 'Create an App'.\n"
-            "3. Note down the 'Client ID' and 'Client Secret'.\n"
-            "4. In your App settings on the dashboard, add this Redirect URI: [bold]http://127.0.0.1:8888/callback[/bold]\n"
-            "5. Enter the credentials below when prompted.",
-            title="[yellow]Spotify API Credentials Setup[/yellow]", border_style="yellow", expand=False
-        ))
-        
-        new_cid = ""
-        while not new_cid:
-            new_cid = Prompt.ask("Enter your Spotify Client ID").strip()
-            if not new_cid: console.print("[red]Client ID cannot be empty. Please try again.[/red]")
-            
-        new_cs = ""
-        while not new_cs:
-            new_cs = Prompt.ask("Enter your Spotify Client Secret", password=True).strip()
-            if not new_cs: console.print("[red]Client Secret cannot be empty. Please try again.[/red]")
+    modified = False
+    for section, keys in DEFAULT_CONFIG.items():
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+            modified = True
+        for key, val in keys.items():
+            if not cfg.has_option(section, key):
+                cfg.set(section, key, val)
+                modified = True
 
+    if cfg.get('Recording', 'sample_rate') not in ['44100', '48000', '96000']:
+        cfg.set('Recording', 'sample_rate', '48000')
+        modified = True
+
+    if cfg.get('Recording', 'bit_depth') not in ['16', '24', '32']:
+        cfg.set('Recording', 'bit_depth', '24')
+        modified = True
+
+    if modified:
         try:
-            if not config.has_section('SpotifyAPI'): config.add_section('SpotifyAPI')
-            config.set('SpotifyAPI', 'SPOTIPY_CLIENT_ID', new_cid)
-            config.set('SpotifyAPI', 'SPOTIPY_CLIENT_SECRET', new_cs)
-            config.set('SpotifyAPI', '#comment1', 'Spotify API credentials.')
-            config.set('SpotifyAPI', '#comment2', 'If you need to change these, edit this file or delete it to re-trigger setup.')
+            with file_lock(CONFIG_FILE_PATH):
+                with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
+                    cfg.write(f)
+        except Exception as e:
+            console.print(f"[red]Error saving config: {e}[/red]")
 
-            if not config.has_section('GeneralSettings'): 
-                config.add_section('GeneralSettings')
-                config.set('GeneralSettings', '# Instructions: Uncomment (remove "#") and edit values below to set your preferred defaults.', None)
-                config.set('GeneralSettings', '# output_directory', 'Recordings')
-                config.set('GeneralSettings', '# default_format', 'flac')
-                config.set('GeneralSettings', '# default_quality_ogg', '7')
-                config.set('GeneralSettings', '# polling_interval_seconds', '0.5')
-                config.set('GeneralSettings', '# audio_device', 'audio=CABLE Output (VB-Audio Virtual Cable) ; For Windows. Check --help for your OS.')
-                config.set('GeneralSettings', '# ffmpeg_path', 'ffmpeg')
-                config.set('GeneralSettings', '# min_duration_seconds', '25')
-                config.set('GeneralSettings', '# recording_buffer_seconds', '-0.2')
-                config.set('GeneralSettings', '# skip_existing_file', 'false')
-                config.set('GeneralSettings', '# organize_by_artist_album', 'false')
+    return cfg
 
-            with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as cf: config.write(cf)
-            console.print(f"[green]Credentials and settings template saved to '{CONFIG_FILE_PATH.name}'.[/green]")
-            console.print("[bold yellow]Please re-run the script now.[/bold yellow]")
-            exit(0) 
-        
-        except OSError as e:
-            console.print(f"[red]Error saving credentials to '{CONFIG_FILE_PATH.name}': {e}[/red]")
-        except configparser.Error as e:
-            console.print(f"[red]Error preparing config data to save: {e}[/red]")
-        
-        console.print("[yellow]Could not save credentials to config file. Please set SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET environment variables as a fallback.[/yellow]")
-        exit(1)
-    
-    console.print("[bold red]Fatal: Could not obtain Spotify credentials after all checks.[/bold red]"); exit(1)
 
-# --- Helper function to get typed config values ---
-def get_typed_config(cfg_parser: configparser.ConfigParser, section: str, option: str, o_type, default):
-    if cfg_parser.has_section(section) and cfg_parser.has_option(section, option): 
-        val = cfg_parser.get(section, option)
-        if not val or val.strip() == "" or val.strip().startswith(('#',';')): 
-            return default
-        try:
-            if o_type == bool: return cfg_parser.getboolean(section, option)
-            if o_type == int: return cfg_parser.getint(section, option)
-            if o_type == float: return cfg_parser.getfloat(section, option)
-            if o_type == Path: return Path(val)
-            return val
-        except ValueError: console.print(f"[yellow]Warning: Invalid config value for '{option}' in section '[{section}]'. Using script default: '{default}'[/yellow]"); return default
-    return default
+def setup_logging(config: configparser.ConfigParser) -> None:
+    """Initialises rotating logs with error handling."""
+    if not config['Diagnostics'].getboolean('enable_logging'):
+        logging.getLogger().addHandler(logging.NullHandler())
+        return
 
-# --- Helper functions (load_recorded_ids, format_time, get_current_track, etc.) ---
-def load_recorded_ids(log_file_path: Path):
-    ids = set()
-    if log_file_path.exists():
-        with open(log_file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                try: entry = json.loads(line); ids.add(entry['track_id'])
-                except (json.JSONDecodeError, KeyError): pass
-    return ids
-
-def format_time(seconds):
-    if seconds is None or not isinstance(seconds, (int, float)) or seconds < 0: return "--:--"
-    minutes = int(seconds // 60); secs = int(seconds % 60)
-    return f"{minutes:02d}:{secs:02d}"
-
-def get_current_track(sp: Spotify):
     try:
-        current = sp.current_playback()
-        if not current: return None
-        is_playing = current.get('is_playing', False); item = current.get('item')
-        if not item or item.get('type') != 'track': return None
-        artists = [a['name'] for a in item.get('artists', [])]
-        return {'id': item['id'], 'name': item['name'], 'artists': artists, 'artist_str': ' & '.join(artists),
-                'album': item.get('album', {}).get('name', 'Unknown Album'),
-                'cover_url': item.get('album', {}).get('images', [{}])[0].get('url') if item.get('album', {}).get('images') else None,
-                'duration_ms': item['duration_ms'], 'is_playing': is_playing}
-    except requests.exceptions.ReadTimeout: console.print("[yellow]Spotify API Read Timeout.[/yellow]")
-    except Exception as e: console.print(f"[red]Error fetching playback: {e}\n{escape(traceback.format_exc())}[/red]")
+        sys_log = resolve_path(config['Diagnostics'].get('log_file'))
+
+        if config['Diagnostics'].getboolean('clear_log_on_startup'):
+            try:
+                if sys_log.exists():
+                    sys_log.unlink()
+            except Exception:
+                pass
+
+        sys_log.parent.mkdir(parents=True, exist_ok=True)
+
+        handler = RotatingFileHandler(
+            sys_log,
+            maxBytes=int(config['Diagnostics'].get('max_log_size_mb', 5)) * 1024 * 1024,
+            backupCount=2,
+            encoding='utf-8'
+        )
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+        logger = logging.getLogger()
+        logger.setLevel(getattr(logging, config['Diagnostics'].get('log_level', 'info').upper(), logging.INFO))
+
+        for h in logger.handlers[:]:
+            logger.removeHandler(h)
+
+        logger.addHandler(handler)
+
+        if config['Diagnostics'].get('log_level', 'info').upper() == 'DEBUG':
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+            logger.addHandler(console_handler)
+
+        logging.info(f"SpytoRec {SCRIPT_VERSION} started on {platform.system()} {platform.release()}")
+
+    except Exception as e:
+        console.print(f"[red]Failed to setup logging: {e}[/red]")
+        logging.basicConfig(level=logging.INFO)
+
+
+cfg = load_config()
+setup_logging(cfg)
+
+
+# --- 2. HELPER FUNCTIONS & LOGIC ---
+
+def set_state(new_state: str, msg: str = "") -> bool:
+    """Thread-safe application state transitions with validation."""
+    global current_state, last_error_msg, error_count
+
+    with state_lock:
+        old_state = current_state
+        allowed_states = VALID_STATE_TRANSITIONS.get(old_state, set())
+
+        if new_state not in allowed_states:
+            logging.warning(f"Invalid state transition: {old_state} -> {new_state}")
+            return False
+
+        if new_state != old_state:
+            logging.info(f"State: {old_state} -> {new_state} {f'[{msg}]' if msg else ''}")
+            current_state = new_state
+
+            if new_state == STATE_ERROR:
+                last_error_msg = msg
+                error_count += 1
+            elif new_state == STATE_RECOVERING:
+                error_count = max(0, error_count - 1)
+            elif new_state == STATE_IDLE:
+                error_count = 0
+
+            return True
+        return False
+
+
+def get_state() -> str:
+    """Get current application state."""
+    with state_lock:
+        return current_state
+
+
+def clean_filename(name: str) -> str:
+    """Strips illegal filesystem characters from filenames (cross-platform safe)."""
+    if not name:
+        return "unknown"
+    cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]', '', str(name))
+    cleaned = cleaned.strip('. ')
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200]
+    return cleaned or "unknown"
+
+
+def get_tail_logs(n: int = 4) -> str:
+    """Safely retrieves end of log file for UI display."""
+    if not cfg['Diagnostics'].getboolean('enable_logging'):
+        return "Logging Disabled"
+
+    path = resolve_path(cfg['Diagnostics'].get('log_file'))
+    try:
+        if not path.exists():
+            return "Waiting for logs..."
+
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+            return "".join(lines[-n:]).strip()
+    except Exception as e:
+        return f"Log Error: {e}"
+
+
+def cleanup_resources():
+    """Clean up all resources before exit."""
+    global active_monitor_stream, ffmpeg_process
+
+    logging.info("Cleaning up resources...")
+
+    stop_monitor_stream()
+
+    with ffmpeg_lock:
+        if ffmpeg_process and ffmpeg_process.poll() is None:
+            try:
+                safely_stop_ffmpeg(ffmpeg_process)
+            except Exception:
+                pass
+        ffmpeg_process = None
+
+    stop_event.set()
+
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    try:
+        if LOCK_FILE_PATH.exists():
+            LOCK_FILE_PATH.unlink()
+    except Exception:
+        pass
+
+
+def signal_handler(signum, frame):
+    """Handle system signals gracefully."""
+    print(f"\nReceived signal {signum}, shutting down...")
+    stop_event.set()
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(cleanup_resources)
+
+
+# --- 3. HARDWARE & MONITORING ---
+
+def stop_monitor_stream() -> None:
+    """Stops the active audio monitor stream safely."""
+    global active_monitor_stream
+
+    try:
+        if active_monitor_stream:
+            active_monitor_stream.stop()
+            active_monitor_stream.close()
+            active_monitor_stream = None
+    except Exception as e:
+        logging.error(f"Monitor stop failed: {e}")
+
+
+def audio_callback_factory(idx: int):
+    """Factory for simple meter callbacks."""
+    def cb(indata, frames, time_info, status):
+        try:
+            rms = np.sqrt(np.mean(indata**2))
+            with meter_lock:
+                meter_data[idx] = rms
+                meter_peaks[idx] = max(meter_peaks.get(idx, 0.0), rms)
+        except Exception:
+            pass
+    return cb
+
+
+def live_monitor_callback(indata, frames, time_info, status) -> None:
+    """Dual-purpose callback: Powers UI meters and monitors audio levels."""
+    global smoothed_rms_l, smoothed_rms_r, peak_l, peak_r, raw_l, raw_r, mono_warning_frames
+    global last_heartbeat
+
+    try:
+        last_heartbeat = time.time()
+
+        if indata.shape[1] >= 2:
+            raw_l = float(np.sqrt(np.mean(indata[:, 0]**2)))
+            raw_r = float(np.sqrt(np.mean(indata[:, 1]**2)))
+        else:
+            raw_l = raw_r = float(np.sqrt(np.mean(indata[:, 0]**2)))
+
+        alpha = 0.4 if cfg['UI'].getboolean('smooth_meter_animation') else 1.0
+        smoothed_rms_l = (alpha * raw_l) + ((1 - alpha) * smoothed_rms_l)
+        smoothed_rms_r = (alpha * raw_r) + ((1 - alpha) * smoothed_rms_r)
+
+        peak_l = max(raw_l, peak_l * 0.99)
+        peak_r = max(raw_r, peak_r * 0.99)
+
+        if raw_l > 0.01 and abs(raw_l - raw_r) < 0.0001:
+            mono_warning_frames += 1
+        else:
+            mono_warning_frames = max(0, mono_warning_frames - 2)
+
+    except Exception as e:
+        logging.debug(f"Monitor callback error: {e}")
+
+
+def start_monitor(idx: int, sr: int, ch: int) -> bool:
+    """Binds to audio device for metering."""
+    global active_monitor_stream
+
+    if ch < 2 and cfg['SafetyChecks'].getboolean('validate_stereo'):
+        logging.error("Stereo validation failed: need at least 2 channels")
+        return False
+
+    try:
+        stop_monitor_stream()
+
+        active_monitor_stream = sd.InputStream(
+            device=idx,
+            channels=min(2, ch),
+            samplerate=sr,
+            callback=live_monitor_callback,
+            blocksize=1024,
+            latency='low'
+        )
+        active_monitor_stream.start()
+        logging.info(f"Monitor started on device {idx} at {sr}Hz")
+        return True
+    except Exception as e:
+        logging.error(f"Monitor bind failed: {e}")
+        return False
+
+
+def get_keypress_unix():
+    """Get a single keypress on Unix systems without blocking."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
+
+
+def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
+    """Interactive hardware wizard with better error handling."""
+    set_state(STATE_IDLE, "Hardware Discovery")
+    console.clear()
+
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        console.print(f"[red]Failed to query audio devices: {e}[/red]")
+        sys.exit(1)
+
+    streams = []
+    active_idx = []
+    dshow_names = []
+
+    # Poll FFmpeg for Friendly DShow Names (Windows only)
+    if os.name == 'nt':
+        try:
+            p = subprocess.run(
+                [ffmpeg_path, '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'],
+                capture_output=True,
+                text=True,
+                errors='ignore',
+                timeout=10
+            )
+            dshow_names = re.findall(r'"(.+?)"', p.stderr)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not list FFmpeg devices: {e}[/yellow]")
+
+    # Find active devices
+    for i, d in enumerate(devices):
+        if d['max_input_channels'] > 0:
+            try:
+                hostapi = sd.query_hostapis(d['hostapi'])
+                if 'WDM-KS' not in hostapi['name']:
+                    s = sd.InputStream(
+                        device=i,
+                        channels=min(d['max_input_channels'], 2),
+                        samplerate=d['default_samplerate'],
+                        callback=audio_callback_factory(i)
+                    )
+                    s.start()
+                    streams.append(s)
+                    active_idx.append(i)
+                    with meter_lock:
+                        meter_data[i] = 0.0
+            except Exception:
+                pass
+
+    if not active_idx:
+        console.print("[red]No suitable input devices found![/red]")
+        sys.exit(1)
+
+    selected = None
+    buf = ""
+
+    def build_hw_table():
+        t = Table(title="[bold cyan]Hardware Selection[/bold cyan]")
+        t.add_column("ID", justify="center")
+        t.add_column("Device Name")
+        t.add_column("Details", style="magenta")
+        t.add_column("Level")
+
+        rows = {}
+        count = 1
+
+        with meter_lock:
+            sorted_idx = sorted(active_idx, key=lambda x: meter_peaks.get(x, 0), reverse=True)
+            for i in sorted_idx:
+                if meter_peaks.get(i, 0) > AUDIO_THRESHOLD:
+                    sr = int(devices[i]['default_samplerate'])
+                    ch = devices[i]['max_input_channels']
+                    level = min(40, int(meter_data.get(i, 0) * 40))
+
+                    t.add_row(
+                        f"[{count}]",
+                        devices[i]['name'],
+                        f"{sr}Hz | {ch}ch",
+                        "\u2588" * level
+                    )
+                    rows[count] = dict(devices[i])
+                    rows[count]['idx'] = i
+                    count += 1
+
+        return Panel(t, subtitle=f"Selection: {buf}"), rows
+
+    console.print("[yellow]Press number keys to select device, Enter to confirm[/yellow]")
+
+    with Live(build_hw_table()[0], refresh_per_second=10) as live:
+        while not selected:
+            try:
+                panel, rows = build_hw_table()
+                live.update(panel)
+
+                if os.name == 'nt':
+                    if msvcrt.kbhit():
+                        c = msvcrt.getch()
+                        if c in [b'\r', b'\n']:
+                            if buf.isdigit() and int(buf) in rows:
+                                selected = rows[int(buf)]
+                            buf = ""
+                        elif c == b'\x08':
+                            buf = buf[:-1]
+                        elif c.isdigit():
+                            buf += c.decode()
+                else:
+                    if select.select([sys.stdin], [], [], 0.05)[0]:
+                        c = get_keypress_unix()
+                        if c in ['\r', '\n']:
+                            if buf.isdigit() and int(buf) in rows:
+                                selected = rows[int(buf)]
+                            buf = ""
+                        elif c == '\x7f':
+                            buf = buf[:-1]
+                        elif c.isdigit():
+                            buf += c
+
+                time.sleep(0.05)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                console.print(f"[red]Selection error: {e}[/red]")
+                time.sleep(1)
+
+    # Cleanup streams
+    for s in streams:
+        try:
+            s.stop()
+            s.close()
+        except Exception:
+            pass
+
+    # Find best FFmpeg name match (Windows DShow only)
+    best_name = selected['name']
+    if os.name == 'nt':
+        for dshow_name in dshow_names:
+            if selected['name'][:15] in dshow_name:
+                best_name = dshow_name
+                break
+
+    # Save to config
+    cfg.set('Recording', 'ffmpeg_name', best_name)
+    cfg.set('Recording', 'device_id', str(selected['idx']))
+    cfg.set('Recording', 'sample_rate', str(int(selected['default_samplerate'])))
+    cfg.set('Recording', 'channels', str(selected['max_input_channels']))
+
+    try:
+        with file_lock(CONFIG_FILE_PATH):
+            with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
+                cfg.write(f)
+    except Exception as e:
+        console.print(f"[yellow]Could not save config: {e}[/yellow]")
+
+    return best_name, selected['idx'], int(selected['default_samplerate']), selected['max_input_channels']
+
+
+# --- 4. RECORDING & SUBPROCESS ---
+
+def watchdog_worker() -> None:
+    """Monitors health of recording threads and FFmpeg."""
+    last_sz = 0
+    stalled_count = 0
+    no_heartbeat_count = 0
+
+    while not stop_event.is_set():
+        try:
+            time.sleep(2.0)
+
+            if not cfg['Debug'].getboolean('watchdog_enabled'):
+                continue
+
+            current_state_val = get_state()
+
+            # Check heartbeat
+            if current_state_val == STATE_RECORDING:
+                if time.time() - last_heartbeat > HEARTBEAT_TIMEOUT:
+                    no_heartbeat_count += 1
+                    if no_heartbeat_count >= 3:
+                        logging.error("Audio stream heartbeat lost")
+                        set_state(STATE_ERROR, "Audio stream lost")
+                else:
+                    no_heartbeat_count = 0
+
+            # Check FFmpeg process
+            with ffmpeg_lock:
+                if ffmpeg_process and ffmpeg_process.poll() is not None:
+                    returncode = ffmpeg_process.poll()
+                    logging.error(f"FFmpeg terminated with code {returncode}")
+                    set_state(STATE_ERROR, f"FFmpeg terminated (code {returncode})")
+
+            # Check file growth
+            if current_state_val == STATE_RECORDING and watchdog_file_ref and watchdog_file_ref.exists():
+                try:
+                    sz = watchdog_file_ref.stat().st_size
+                    if sz == last_sz and sz > 0:
+                        stalled_count += 1
+                        if stalled_count >= 3:
+                            logging.warning("Recording file stalled")
+                            stalled_count = 0
+                    else:
+                        stalled_count = 0
+                        last_sz = sz
+                except Exception as e:
+                    logging.debug(f"File size check failed: {e}")
+
+        except Exception as e:
+            logging.error(f"Watchdog error: {e}")
+
+
+def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: str) -> bool:
+    """Tags and moves the recorded file with integrity checking."""
+    if not temp_file or not temp_file.exists():
+        return False
+
+    try:
+        # Verify file integrity
+        if cfg['SafetyChecks'].getboolean('validate_file_integrity'):
+            if temp_file.stat().st_size < 8192:
+                logging.warning(f"File too small, possible corruption: {temp_file}")
+                temp_file.unlink()
+                return False
+
+        # Wait a moment for file to be fully written
+        time.sleep(1.5)
+
+        # Clean filenames
+        artist = clean_filename(track_info['artists'][0]['name'])
+        album = clean_filename(track_info['album']['name'])
+        title = clean_filename(track_info['name'])
+        track_no = str(track_info.get('track_number', 0)).zfill(2)
+        year = track_info['album'].get('release_date', '0000')[:4]
+
+        tags = {
+            'artist': artist,
+            'album': album,
+            'title': title,
+            'track_no': track_no,
+            'year': year
+        }
+
+        # Create final path
+        try:
+            final_name = naming_format.format(**tags)
+        except KeyError as e:
+            logging.warning(f"Missing tag in naming format: {e}, using fallback")
+            final_name = f"{track_no}. {artist} - {title}"
+
+        final_name = clean_filename(final_name)
+        final_path = out_dir / f"{final_name}.flac"
+
+        # Handle existing files
+        if final_path.exists():
+            if not cfg['Recording'].getboolean('overwrite_existing'):
+                timestamp = int(time.time())
+                final_path = out_dir / f"{final_name}_{timestamp}.flac"
+                logging.info(f"File exists, created: {final_path.name}")
+            else:
+                logging.info(f"Overwriting existing file: {final_path.name}")
+
+        # Load and tag the FLAC file
+        audio = FLAC(temp_file)
+
+        audio['title'] = track_info['name']
+        audio['artist'] = track_info['artists'][0]['name']
+        audio['album'] = track_info['album']['name']
+        audio['date'] = year
+        audio['tracknumber'] = track_no
+
+        # Add album art with content-type and size validation
+        if not cfg['Recording'].getboolean('force_safe_mode'):
+            try:
+                images = track_info['album'].get('images', [])
+                if images:
+                    img_url = images[0]['url']
+                    response = requests.get(img_url, timeout=5, stream=True)
+                    if response.status_code == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        # Reject immediately if Content-Length header exceeds our cap
+                        content_length = response.headers.get('Content-Length')
+                        if content_length and int(content_length) > MAX_COVER_ART_BYTES:
+                            logging.warning(f"Album art Content-Length exceeds {MAX_COVER_ART_BYTES} byte limit, skipping")
+                        elif content_type.startswith('image/'):
+                            # Read with size cap to prevent memory exhaustion
+                            img_data = b''
+                            for chunk in response.iter_content(chunk_size=65536):
+                                img_data += chunk
+                                if len(img_data) > MAX_COVER_ART_BYTES:
+                                    logging.warning(f"Album art exceeds {MAX_COVER_ART_BYTES} byte limit, skipping")
+                                    img_data = b''
+                                    break
+                            if img_data:
+                                mime = content_type.split(';')[0].strip()
+                                picture = Picture()
+                                picture.data = img_data
+                                picture.type = 3
+                                picture.mime = mime
+                                picture.desc = "Cover Art"
+                                audio.add_picture(picture)
+                                logging.debug("Added album art")
+                        else:
+                            logging.warning(f"Unexpected content type for album art: {content_type}")
+            except Exception as e:
+                logging.debug(f"Could not add album art: {e}")
+
+        # Save the tagged file
+        audio.save()
+
+        # Move to final location
+        temp_file.replace(final_path)
+        logging.info(f"Finalised: {final_path.name}")
+        return True
+
+    except Exception as e:
+        logging.exception(f"Finalise Error: {e}")
+        try:
+            if temp_file and temp_file.exists():
+                temp_file.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def safely_stop_ffmpeg(proc) -> None:
+    """Shutdown protocol for FFmpeg to prevent pipe corruption."""
+    if not proc or proc.poll() is not None:
+        return
+
+    set_state(STATE_STOPPING)
+
+    try:
+        if proc.stdin:
+            proc.stdin.write(b'q')
+            proc.stdin.flush()
+            proc.stdin.close()
+
+        try:
+            proc.wait(timeout=10)
+            logging.info("FFmpeg stopped gracefully")
+        except subprocess.TimeoutExpired:
+            logging.warning("FFmpeg didn't respond, terminating...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                logging.warning("FFmpeg killed")
+
+    except Exception as e:
+        logging.error(f"Error stopping FFmpeg: {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def spotify_with_retry(sp, max_retries=3):
+    """Get Spotify playback with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            return sp.current_playback()
+        except SpotifyException as e:
+            if e.http_status == 429:
+                retry_after = int(e.headers.get('Retry-After', 5))
+                logging.warning(f"Rate limited, waiting {retry_after}s")
+                time.sleep(retry_after)
+            elif attempt < max_retries - 1:
+                logging.warning(f"Spotify API error: {e}, retrying...")
+                time.sleep(1 * (attempt + 1))
+            else:
+                raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                raise
     return None
 
-def download_cover(url: str, cover_path: Path):
-    if not url: return False
-    try:
-        r = requests.get(url, timeout=10); r.raise_for_status()
-        with open(cover_path, 'wb') as f: f.write(r.content)
-        return True
-    except requests.exceptions.RequestException as e: console.print(f"[red][Worker] Cover DL error: {e}[/red]"); return False
 
-def embed_metadata(audio_path: Path, metadata: dict, cover_path: Path):
-    try:
-        if not audio_path.exists() or audio_path.stat().st_size == 0: return
-        if audio_path.suffix == '.ogg': audio = OggVorbis(audio_path)
-        elif audio_path.suffix == '.flac': audio = FLAC(audio_path)
-        else: return
-        audio['TITLE'] = metadata['name']; audio['ARTIST'] = metadata['artist_str']; audio['ALBUM'] = metadata['album']
-        if audio_path.suffix == '.flac' and cover_path.exists():
-            img = Picture(); img.data = cover_path.read_bytes()
-            img.type = 3; img.mime = 'image/jpeg' 
-            audio.add_picture(img)
-        audio.save()
-    except Exception as e: console.print(f"[red][Worker] Metadata embed error for {audio_path.name}: {e}[/red]")
+# --- 5. UI HELPER FUNCTIONS ---
 
-def sanitize_for_filesystem(text: str, max_len: int = 70):
-    text = "".join(c if c.isalnum() or c in " ._-" else "_" for c in text).strip()
-    text = re.sub(r'[_ ]{2,}', '_', text) 
-    return text[:max_len].strip('_')
-
-def generate_safe_filename(artist_str: str, name: str, audio_format: str): 
-    s_track_artist = sanitize_for_filesystem(artist_str)
-    s_track_title = sanitize_for_filesystem(name)
-    return f"{s_track_artist} - {s_track_title}.{audio_format}"
-
-def rewrite_audio_file(audio_path: Path, ffmpeg_exe: str, console_instance: Console):
-    if not audio_path.exists() or audio_path.stat().st_size < 1024: 
-        console_instance.print(f"[yellow][Worker] Rewrite skipped for '{audio_path.name}' (missing or too small).[/yellow]")
-        return False 
-    
-    original_stem = audio_path.stem
-    original_suffix = audio_path.suffix
-    temp_audio_path = audio_path.parent / (original_stem + "_rewrite_temp" + original_suffix)
-
-    console_instance.print(f"[grey50][Worker] Rewriting '{audio_path.name}' for headers...[/grey50]")
-    cmd = [ffmpeg_exe, '-y', '-i', str(audio_path), '-acodec', 'copy', '-vn', '-map_metadata', '-1', str(temp_audio_path)]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore', timeout=120)
-        if res.returncode == 0 and temp_audio_path.exists() and temp_audio_path.stat().st_size >= 1024:
-            audio_path.unlink(missing_ok=True); temp_audio_path.rename(audio_path)
-            console_instance.print(f"[green][Worker] Rewrote headers for '{audio_path.name}'.[/green]"); return True
-        else:
-            console_instance.print(f"[red][Worker] Rewrite failed for '{audio_path.name}' (Code: {res.returncode}). Original kept.[/red]")
-            if res.stderr: console_instance.print(f"[grey70]{escape(res.stderr.strip())}[/grey70]")
-            temp_audio_path.unlink(missing_ok=True); return False
-    except Exception as e:
-        console_instance.print(f"[red][Worker] Rewrite error for '{audio_path.name}': {e}. Original kept.[/red]")
-        temp_audio_path.unlink(missing_ok=True); return False
-
-def finalization_worker_function(ffmpeg_exe_cfg: str, log_file_path_global: Path):
-    console.print("[cyan]Finalization worker started.[/cyan]")
-    while not stop_worker_event.is_set() or not finalization_task_queue.empty():
-        try:
-            task = finalization_task_queue.get(timeout=1)
-            proc, audio_p, meta, stop_r, start_iso, exp_dur, ffmpeg_p_arg = \
-                task['process_obj'], task['audio_path'], task['metadata'], task['stop_reason'], \
-                task['start_iso'], task['expected_duration_sec'], task.get('ffmpeg_path_arg', ffmpeg_exe_cfg)
-            
-            console.print(f"[grey50][Worker] Processing: '{meta['name']}' (Reason: {stop_r})[/grey50]")
-            stderr_b = b""; exit_c = -99; graceful_stop_by_q = False
-            
-            if proc.poll() is None: 
-                try:
-                    _, stderr_b = proc.communicate(timeout=20) 
-                    exit_c = proc.returncode
-                    graceful_stop_by_q = task.get('q_sent_by_main', False) and (exit_c == 0 or exit_c == 255)
-
-                except subprocess.TimeoutExpired:
-                    console.print(f"[yellow][Worker] FFmpeg for '{meta['name']}' timed out post 'q'/communicate. Killing.[/yellow]")
-                    proc.kill(); _, stderr_b = proc.communicate(timeout=5)
-                    exit_c = proc.poll() if proc.poll() is not None else -1
-            else: 
-                exit_c = proc.poll()
-                graceful_stop_by_q = task.get('q_sent_by_main', False) and (exit_c == 0 or exit_c == 255)
-                try: 
-                    if proc.stderr: stderr_b = proc.stderr.read()
-                except Exception: pass 
-            
-            console.print(f"[grey50][Worker] FFmpeg exit for '{meta['name']}': {exit_c} (Graceful Q success: {graceful_stop_by_q})[/grey50]")
-            
-            file_ok_initially = audio_p.exists() and audio_p.stat().st_size > 1024
-            is_early_stop_by_logic = stop_r in ["Track changed", "Playback stopped or track unavailable", "User interrupted", "Shutdown", "Main loop error"]
-            is_valid_initial_exit = (exit_c == 0) or graceful_stop_by_q 
-            
-            if not (is_valid_initial_exit or (is_early_stop_by_logic and file_ok_initially)):
-                console.print(f"[red][Worker] FFmpeg for '{meta['name']}' had an issue (Code: {exit_c}).[/red]")
-                if stderr_b: console.print(f"[grey70]{escape(stderr_b.decode('utf-8', errors='ignore').strip())}[/grey70]")
-                if audio_p.exists() and not file_ok_initially: 
-                    audio_p.unlink(missing_ok=True)
-                    console.print(f"[yellow][Worker] Deleted unusable file: {audio_p.name}[/yellow]")
-                finalization_task_queue.task_done(); continue
-
-            rewrite_ok = False
-            if file_ok_initially: 
-                rewrite_ok = rewrite_audio_file(audio_p, ffmpeg_p_arg, console)
-            
-            if audio_p.exists() and audio_p.stat().st_size > 1024:
-                cover_p = audio_p.with_name(f"{audio_p.stem}_cover.jpg")
-                cover_ok = download_cover(meta['cover_url'], cover_p)
-                embed_metadata(audio_p, meta, cover_p)
-                if cover_ok and cover_p.exists(): cover_p.unlink(missing_ok=True)
-                
-                end_iso = datetime.now(timezone.utc).isoformat()
-                actual_dur = -1
-                try: actual_dur = (datetime.fromisoformat(end_iso) - datetime.fromisoformat(start_iso)).total_seconds()
-                except ValueError: pass
-                
-                log_entry = {'track_id': meta['id'], 'title': meta['name'], 
-                             'artist_str': meta['artist_str'], 'album': meta['album'], 
-                             'start_time': start_iso, 'end_time': end_iso,
-                             'original_duration_sec': meta['duration_ms'] / 1000,
-                             'ffmpeg_target_duration_sec': exp_dur,
-                             'recorded_duration_seconds': round(actual_dur,2) if actual_dur !=-1 else "N/A", 
-                             'header_rewrite_successful': rewrite_ok,
-                             'ffmpeg_initial_exit_code': exit_c, 'stop_reason': stop_r, 
-                             'filename': str(audio_p.relative_to(log_file_path_global.parent)), 
-                             'format': audio_p.suffix.lstrip('.')}
-                
-                with open(log_file_path_global, 'a', encoding='utf-8') as f: f.write(json.dumps(log_entry) + '\n')
-                console.print(f"[bold green][Worker] ✔ Finalized:[/bold green] {audio_p.name}\n")
-            elif file_ok_initially and not rewrite_ok: 
-                console.print(f"[red][Worker] File '{audio_p.name}' became unusable after failed rewrite. No metadata embedded.[/red]")
-            elif not file_ok_initially:
-                 console.print(f"[yellow][Worker] Initial file '{audio_p.name}' was too small or missing. Not finalizing.[/yellow]")
-            else: 
-                 console.print(f"[yellow][Worker] File '{audio_p.name}' not found or unusable for unknown reason. Not finalizing.[/yellow]")
-
-            finalization_task_queue.task_done()
-        except queue.Empty:
-            if stop_worker_event.is_set() and finalization_task_queue.empty(): break
-        except Exception as e:
-            console.print(f"[bold red][Worker] Critical Error in finalization loop: {e}\n{escape(traceback.format_exc())}[/bold red]")
-            try: finalization_task_queue.task_done() 
-            except ValueError: pass 
-
-    console.print("[cyan]Finalization worker stopped.[/cyan]")
+def get_health_indicator(rms: float) -> str:
+    """Returns health status based on RMS level."""
+    if rms > 0.85:
+        return "[bold red]\U0001f534 Clipping[/bold red]"
+    if rms < 0.001:
+        return "[yellow]\U0001f7e1 Low[/yellow]"
+    return "[green]\U0001f7e2 Good[/green]"
 
 
-def start_recording(track_m: dict, audio_fmt: str, out_dir_base: Path, ogg_q: int, dev_name: str, 
-                    ffmpeg_exe: str, rec_buf: float, min_dur: int, organize: bool):
-    global current_ffmpeg_process, current_recording_info
-    dur_sec = track_m['duration_ms'] / 1000
-    if dur_sec < min_dur: 
-        console.print(f"[yellow]Track '{track_m['name']}' is too short ({dur_sec:.1f}s < {min_dur}s). Skipping.[/yellow]")
-        return False
+def build_gradient_bar(rms: float, peak: float, width: int = 40, show_peak: bool = True) -> str:
+    """Builds a gradient level meter bar."""
+    if np.isnan(rms) or rms <= 1e-6:
+        return "[dim]\u2501[/dim]" * width
 
-    file_name_part = generate_safe_filename(track_m['artist_str'], track_m['name'], audio_fmt)
-    
-    if organize:
-        s_artist_folder = sanitize_for_filesystem(track_m.get('artists', [{}])[0].get('name', 'Unknown Artist'))
-        s_album_folder = sanitize_for_filesystem(track_m['album'])
-        target_dir_for_file = out_dir_base / s_artist_folder / s_album_folder
-        audio_p_final = target_dir_for_file / file_name_part
-    else:
-        target_dir_for_file = out_dir_base
-        audio_p_final = target_dir_for_file / file_name_part
+    db = 20 * np.log10(rms + 1e-9)
+    db_peak = 20 * np.log10(peak + 1e-9)
 
-    try: target_dir_for_file.mkdir(parents=True, exist_ok=True)
-    except OSError as e: console.print(f"[red]Error creating dir '{target_dir_for_file}': {e}[/red]"); return False
-    
-    rec_for_duration = max(0.1, dur_sec + rec_buf)
-    console.print(Panel.fit(
-        f"🎧 Start: {track_m['artist_str']} - {track_m['name']} ({audio_fmt.upper()})\n"
-        f"   To: [grey50]{audio_p_final}[/grey50]\n"
-        f"   Target duration: ~{rec_for_duration:.1f}s", 
-        title="[green]Recording Initiated[/green]", border_style="green"
-    ))
-    
-    input_format = 'dshow' if os.name == 'nt' else ('avfoundation' if sys.platform == 'darwin' else 'alsa')
-    cmd = [ffmpeg_exe, '-y', '-f', input_format, '-i', dev_name, '-t', str(rec_for_duration)]
-    if audio_fmt == 'ogg': cmd += ['-acodec', 'libvorbis', '-qscale:a', str(ogg_q), '-vn']
-    elif audio_fmt == 'flac': cmd += ['-acodec', 'flac', '-vn']
-    else: console.print(f"[red]Unsupported format: {audio_fmt}[/red]"); return False
-    cmd.append(str(audio_p_final))
-    
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        current_ffmpeg_process = proc
-        current_recording_info = {'process_obj': proc, 'track_id': track_m['id'], 
-                                  'start_iso': datetime.now(timezone.utc).isoformat(),
-                                  'audio_path': audio_p_final, 'metadata': track_m, 
-                                  'expected_duration_sec': rec_for_duration, 
-                                  'ffmpeg_path_arg': ffmpeg_exe}
-        return True
-    except FileNotFoundError:
-        console.print(f"[bold red]Error: FFmpeg executable not found at '{ffmpeg_exe}'. Please check path or install FFmpeg.[/bold red]")
-        return False
-    except Exception as e: 
-        console.print(f"[red]FFmpeg start error for {track_m['name']}: {e}[/red]")
-        console.print(f"[grey50]Command attempted: {' '.join(cmd)}[/grey50]")
-        return False
+    fill = int(np.clip((db + 60) / 60 * width, 0, width))
+    peak_pos = int(np.clip((db_peak + 60) / 60 * width, 0, width - 1))
 
-def submit_to_finalization_queue(reason: str):
-    global current_ffmpeg_process, current_recording_info
-    if not current_ffmpeg_process or not current_recording_info:
-        if current_ffmpeg_process and current_ffmpeg_process.poll() is None: 
-             try: current_ffmpeg_process.kill() 
-             except Exception: pass
-        current_ffmpeg_process = None; current_recording_info = {}; return
-
-    rec_info_snap = current_recording_info.copy(); ffmpeg_proc_snap = current_ffmpeg_process
-    current_ffmpeg_process = None; current_recording_info = {}   
-    
-    console.print(f"[yellow]Stop requested for '{rec_info_snap['metadata']['name']}' (Reason: {reason}). Queuing for finalization.[/yellow]")
-    
-    q_was_sent_by_main = False
-    if ffmpeg_proc_snap.poll() is None: 
-        try:
-            if ffmpeg_proc_snap.stdin and not ffmpeg_proc_snap.stdin.closed:
-                console.print(f"[grey50]Sending 'q' to FFmpeg for '{rec_info_snap['metadata']['name']}'...[/grey50]")
-                ffmpeg_proc_snap.stdin.write(b'q') 
-                ffmpeg_proc_snap.stdin.flush()
-                q_was_sent_by_main = True
+    bar_chars = []
+    for i in range(width):
+        if show_peak and i == peak_pos:
+            bar_chars.append("[white]\u275a[/white]")
+        elif i < fill:
+            if i < width * 0.6:
+                bar_chars.append("[green]\u2588[/green]")
+            elif i < width * 0.85:
+                bar_chars.append("[yellow]\u2588[/yellow]")
             else:
-                console.print(f"[yellow]Stdin not available for 'q' on '{rec_info_snap['metadata']['name']}'. Worker will use terminate/kill.[/yellow]")
-        except (OSError, BrokenPipeError, ValueError) as e: 
-            console.print(f"[yellow]Error sending 'q' for '{rec_info_snap['metadata']['name']}': {e}. Worker handles termination.[/yellow]")
-
-    task = rec_info_snap; task['process_obj'] = ffmpeg_proc_snap; task['stop_reason'] = reason
-    task['q_sent_by_main'] = q_was_sent_by_main # Let worker know
-    finalization_task_queue.put(task)
-
-# --- Subcommand Functions ---
-def execute_list_devices_command(args_list_devices: argparse.Namespace, config_obj: configparser.ConfigParser):
-    ffmpeg_exe = args_list_devices.ffmpeg_path
-    console.print(f"\n[bold cyan]Listing audio devices using FFmpeg path: '{ffmpeg_exe}'[/bold cyan]")
-    cmd_to_run = None; guidance = ""
-    if os.name == 'nt': 
-        cmd_to_run = [ffmpeg_exe, '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy']
-        guidance = ("For Windows, find names under 'DirectShow audio devices' (e.g., \"Microphone (...)\", \"CABLE Output (...)\").\n"
-                    "Use the name in quotes for --device, prefixed with 'audio='. Ex: --device \"audio=CABLE Output (VB-Audio Virtual Cable)\"")
-    elif sys.platform == 'darwin':
-        cmd_to_run = [ffmpeg_exe, '-f', 'avfoundation', '-list_devices', 'true', '-i', '""']
-        guidance = ("For macOS, find AVFoundation devices and their indexes (e.g., \"[0] BlackHole 2ch\", \"[1] MacBook Pro Microphone\").\n"
-                    "Use index OR name for --device. Ex: --device \"0\" or --device \"BlackHole 2ch\"")
-    else: # Linux
-        guidance = ("For Linux, use system tools to find device names/indexes:\n"
-                    "  ALSA: `arecord -L` (look for card,device like 'hw:0,0')\n"
-                    "  PulseAudio: `pactl list sources short` (look for source name or index; often use '.monitor' of an output sink for loopback).\n"
-                    "Common FFmpeg --device values: 'default', 'pulse', 'hw:0,0'.")
-    
-    if guidance: console.print(Panel(Text.from_markup(guidance), title="[yellow]Device Identification Guidance[/yellow]", border_style="yellow", expand=False))
-    
-    if cmd_to_run:
-        console.print(f"\nRunning FFmpeg command: [code]{' '.join(cmd_to_run)}[/code]")
-        try:
-            process = subprocess.Popen(cmd_to_run, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
-            stdout_output, _ = process.communicate(timeout=20)
-            console.print("\n--- FFmpeg Output ---")
-            if stdout_output and stdout_output.strip(): console.print(escape(stdout_output))
-            else: console.print("[italic grey50]No specific device list output from FFmpeg. It might have listed general options or encountered an internal error. Check FFmpeg documentation for your OS if device names are unclear.[/italic grey50]")
-        except FileNotFoundError: console.print(f"[bold red]Error: FFmpeg not found at '{ffmpeg_exe}'.[/bold red]")
-        except subprocess.TimeoutExpired: console.print(f"[red]Error: FFmpeg command timed out.[/red]")
-        except Exception as e: console.print(f"[red]Error listing devices: {e}[/red]")
-    elif os.name != 'nt' and sys.platform != 'darwin':
-        console.print("\n[italic]For detailed FFmpeg device enumeration on Linux, please refer to FFmpeg documentation for ALSA or PulseAudio input devices, or use the system commands mentioned above.[/italic]")
-
-def execute_test_auth_command(args_test_auth: argparse.Namespace, config_obj: configparser.ConfigParser):
-    console.print("\n[bold cyan]Testing Spotify API Authentication...[/bold cyan]")
-    try:
-        client_id, client_secret = get_spotify_credentials() 
-        sp = Spotify(auth_manager=SpotifyOAuth(
-            client_id=client_id, client_secret=client_secret,
-            redirect_uri=SPOTIPY_REDIRECT_URI, scope=SPOTIPY_SCOPE,
-            open_browser=False, requests_timeout=10 
-        ))
-        user = sp.current_user()
-        if user and user.get('display_name'):
-            console.print(f"[green]✔ Authentication successful for user: [bold]{user['display_name']}[/bold] ({user['id']})[/green]")
+                bar_chars.append("[red]\u2588[/red]")
         else:
-            console.print("[red]❌ Auth may have succeeded (token obtained) but failed to fetch user details clearly.[/red]")
-            try:
-                token_info = sp.auth_manager.get_access_token(check_cache=False)
-                if token_info and token_info.get('access_token'): console.print("[green]✔ Token obtained directly. API access likely working.[/green]")
-                else: console.print("[red]❌ Failed to obtain access token directly.[/red]"); return
-            except Exception as token_err: console.print(f"[red]❌ Error during direct token fetch: {token_err}[/red]"); return
+            bar_chars.append("[dim]\u2501[/dim]")
 
-        console.print("\n[bold cyan]Fetching current playback state...[/bold cyan]")
-        playback = sp.current_playback()
-        if playback and playback.get('item'):
-            console.print("[green]✔ Playback state context fetched.[/green]")
-            if playback['item']['type'] == 'track':
-                console.print(f"  Status:     {'Playing' if playback['is_playing'] else 'Paused'}")
-                console.print(f"  Track:      {playback['item']['artists'][0]['name']} - {playback['item']['name']}")
-                console.print(f"  Album:      {playback['item']['album']['name']}")
-                prog_ms = playback.get('progress_ms',0); dur_ms = playback['item']['duration_ms']
-                console.print(f"  Progress:   {format_time(prog_ms/1000)} / {format_time(dur_ms/1000)}")
-            else: console.print(f"  Playing:    A '{playback['item']['type']}'.")
-            if playback.get('device'): console.print(f"  Device:     {playback['device']['name']} ({playback['device']['type']})")
-        else: console.print("  No active playback or nothing specific playing.")
-    except Exception as e:
-        console.print(f"[bold red]❌ Test authentication or playback fetch failed: {e}[/bold red]\n{escape(traceback.format_exc())}")
+    return "".join(bar_chars)
 
-def execute_record_command(args: argparse.Namespace, config_obj: configparser.ConfigParser):
-    global current_ffmpeg_process, current_recording_info 
-    console.print(f"\n[bold green]Starting Record Mode[/bold green]")
-    console.print(f"  Output Directory:      '{args.dir}'")
-    console.print(f"  Audio Format:          {args.format.upper()} " + (f"(OGG Quality: {args.quality})" if args.format == 'ogg' else ""))
-    console.print(f"  Organize by Artist/Album: {args.organize}")
-    console.print(f"  Skip Existing Files:   {args.skip_existing_file}") # This now reflects the processed default
-    # ... (print other relevant args as desired) ...
 
-    try: args.dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e: console.print(f"[red]Fatal: Cannot create output dir '{args.dir}': {e}.[/red]"); return
-    resolved_log_file_path = args.dir / 'spytorec_metadata.jsonl' # Worker uses this global via argument
-    
-    try:
-        client_id, client_secret = get_spotify_credentials()
-        sp = Spotify(auth_manager=SpotifyOAuth(
-            client_id=client_id, client_secret=client_secret, redirect_uri=SPOTIPY_REDIRECT_URI,
-            scope=SPOTIPY_SCOPE, open_browser=True, requests_timeout=15
-        ))
-        user = sp.current_user() 
-        if not user or not user.get('display_name'):
-            console.print("[red]Fatal: Spotify auth succeeded but no user details. Exiting.[/red]"); stop_worker_event.set(); return
-        console.print(f"[green]Authenticated as [bold]{user['display_name']}[/bold]. Polling: {args.interval}s.[/green]")
-    except Exception as e:
-        console.print(f"[bold red]Spotify auth failed for recording: {e}[/bold red]"); stop_worker_event.set(); return
-
-    persisted_recorded_ids = load_recorded_ids(resolved_log_file_path)
-    session_attempted_ids = set() 
-    console.print(f"Loaded [bold cyan]{len(persisted_recorded_ids)}[/bold cyan] track IDs from log: '{resolved_log_file_path.name}'.")
-    console.print(Panel("[bold]Spotify Recorder Active[/bold]", subtitle="Monitoring Spotify... Press Ctrl+C to stop.", border_style="sky_blue1"))
-    try:
-        current_status_message = "[italic grey50]Initializing...[/italic grey50]"
-        with console.status(current_status_message, spinner="line", speed=1.5) as status:
-            while True:
-                if stop_worker_event.is_set(): break 
-                spotify_info = get_current_track(sp)
-                if current_ffmpeg_process: 
-                    active_rec_name = current_recording_info.get('metadata',{}).get('name','Unknown Track')
-                    try:
-                        start_dt_str = current_recording_info.get('start_iso', '')
-                        start_dt = datetime.fromisoformat(start_dt_str) 
-                        if start_dt.tzinfo is None: start_dt = start_dt.replace(tzinfo=timezone.utc)
-                        elapsed_seconds = (datetime.now(timezone.utc) - start_dt).total_seconds()
-                        total_seconds_api = current_recording_info.get('metadata', {}).get('duration_ms', 0) / 1000
-                        current_status_message = f"Recording: [cyan]{active_rec_name}[/cyan] [{format_time(elapsed_seconds)} / {format_time(total_seconds_api)}]"
-                    except Exception: current_status_message = f"Recording: [yellow]{active_rec_name} (Calculating time...)[/yellow]"
-                    stop_reason = None
-                    if current_ffmpeg_process.poll() is not None: stop_reason = "FFmpeg process ended"
-                    elif not spotify_info or not spotify_info.get('is_playing'): stop_reason = "Playback stopped or track unavailable"
-                    elif spotify_info and spotify_info.get('id') != current_recording_info.get('track_id'): stop_reason = "Track changed"
-                    if stop_reason: submit_to_finalization_queue(stop_reason)
-                elif spotify_info and spotify_info.get('is_playing') and spotify_info.get('id'): 
-                    current_track_id = spotify_info['id']; current_track_name = spotify_info['name']
-                    current_status_message = f"Detected: [cyan]{spotify_info['artist_str']} - {current_track_name}[/cyan]"
-                    if current_track_id in persisted_recorded_ids or current_track_id in session_attempted_ids:
-                        console.print(f"[grey50]Skipping '{current_track_name}' (already handled/logged).[/grey50]")
-                        sp.next_track()
-                    else:
-                        # Determine potential full path for skip check based on organization flag
-                        file_name_part_for_check = generate_safe_filename(spotify_info['artist_str'], spotify_info['name'], args.format)
-                        if args.organize:
-                            s_artist_folder = sanitize_for_filesystem(spotify_info.get('artists', [{}])[0].get('name', 'Unknown Artist'))
-                            s_album_folder = sanitize_for_filesystem(spotify_info['album'])
-                            path_for_skip_check = args.dir / s_artist_folder / s_album_folder / file_name_part_for_check
-                        else:
-                            path_for_skip_check = args.dir / file_name_part_for_check
-                        
-                        if args.skip_existing_file and path_for_skip_check.exists():
-                            skip_msg = f"[yellow]File exists ('{path_for_skip_check.name}'), skipping '{current_track_name}'.[/yellow]"
-                            if current_track_id not in session_attempted_ids: console.print(skip_msg); session_attempted_ids.add(current_track_id)
-                            current_status_message = skip_msg
-                        else:
-                             if start_recording(spotify_info, args.format, args.dir, args.quality, args.device, 
-                                                args.ffmpeg_path, args.recording_buffer, args.min_duration, args.organize):
-                                 session_attempted_ids.add(current_track_id)
-                             else: 
-                                  current_status_message = f"[yellow]Start fail for '{current_track_name}'. Waiting...[/yellow]"
-                                  if spotify_info['duration_ms'] / 1000 < args.min_duration:
-                                       session_attempted_ids.add(current_track_id)
-                else: current_status_message = "[italic grey50]Waiting for a track to play...[/italic grey50]"
-                status.update(current_status_message)
-                time.sleep(args.interval)
-    except KeyboardInterrupt: console.print("\n[yellow][Record Mode] Keyboard Interrupt. Preparing to shut down record loop...[/yellow]")
-    except Exception as e: console.print(f"\n[red][Record Mode] Critical error in recording loop: {e}\n{escape(traceback.format_exc())}[/red]")
-    finally:
-        if current_ffmpeg_process: submit_to_finalization_queue("Record loop ended or error")
-
+# --- 6. MAIN ENGINE ---
 
 def main():
-    global current_ffmpeg_process, current_recording_info 
-    display_intro_banner() # Display banner first
-    display_disclaimer()
-    
-    config = configparser.ConfigParser(allow_no_value=True, inline_comment_prefixes=('#',';'))
-    hardcoded_defaults = {
-        'format': 'flac', 'dir': Path('Recordings'), 'quality': 7, 'interval': 0.5,
-        'device': 'audio=CABLE Output (VB-Audio Virtual Cable)' if os.name == 'nt' else ('default' if sys.platform != 'darwin' else '0'),
-        'ffmpeg_path': 'ffmpeg', 'skip_existing_file': False, 'min_duration': 25, 
-        'recording_buffer': -0.2, 'organize': False
-    }
-    if CONFIG_FILE_PATH.exists():
-        try: config.read(CONFIG_FILE_PATH, encoding='utf-8')
-        except configparser.Error as e: console.print(f"[red]Error reading '{CONFIG_FILE_PATH.name}': {e}. Using script defaults.[/red]")
+    global ffmpeg_process, watchdog_proc_ref, watchdog_file_ref, current_track_id_ref
 
-    parser = argparse.ArgumentParser(
-        description="🎵 SpytoRec: Spotify Track Recorder & Utilities.",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog="Example: python spytorec.py record --format ogg --organize"
-    )
-    parser.add_argument('-v', '--version', action='version', version=f'SpytoRec v{SCRIPT_VERSION}') 
-    subparsers = parser.add_subparsers(title="Available Commands", dest="command_name", metavar="COMMAND",
-                                       help="Use COMMAND -h for command-specific help.")
-    
-    # --- Define defaults using config or hardcoded ---
-    cfg_dir = get_typed_config(config, 'GeneralSettings', 'output_directory', Path, hardcoded_defaults['dir'])
-    cfg_fmt = get_typed_config(config, 'GeneralSettings', 'default_format', str, hardcoded_defaults['format'])
-    cfg_q = get_typed_config(config, 'GeneralSettings', 'default_quality_ogg', int, hardcoded_defaults['quality'])
-    cfg_int = get_typed_config(config, 'GeneralSettings', 'polling_interval_seconds', float, hardcoded_defaults['interval'])
-    cfg_dev = get_typed_config(config, 'GeneralSettings', 'audio_device', str, hardcoded_defaults['device'])
-    cfg_ffp = get_typed_config(config, 'GeneralSettings', 'ffmpeg_path', str, hardcoded_defaults['ffmpeg_path'])
-    cfg_skip = get_typed_config(config, 'GeneralSettings', 'skip_existing_file', bool, hardcoded_defaults['skip_existing_file'])
-    cfg_min_d = get_typed_config(config, 'GeneralSettings', 'min_duration_seconds', int, hardcoded_defaults['min_duration'])
-    cfg_rec_b = get_typed_config(config, 'GeneralSettings', 'recording_buffer_seconds', float, hardcoded_defaults['recording_buffer'])
-    cfg_org = get_typed_config(config, 'GeneralSettings', 'organize_by_artist_album', bool, hardcoded_defaults['organize'])
+    # Parse arguments
+    parser = argparse.ArgumentParser(description=f'SpytoRec v{SCRIPT_VERSION} - Spotify Recording Tool')
+    parser.add_argument('--ffmpeg', default='ffmpeg', help='Path to ffmpeg executable')
+    args = parser.parse_args()
 
-    # --- Record Subcommand Parser ---
-    parser_record = subparsers.add_parser("record", help="Record Spotify tracks (default action).", aliases=['rec'], formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser_record.add_argument('--format', choices=['ogg', 'flac'], default=cfg_fmt, help="Audio format.")
-    parser_record.add_argument('--dir', type=Path, default=cfg_dir, help="Output directory.")
-    parser_record.add_argument('--quality', type=int, default=cfg_q, help="OGG quality (0-10).")
-    parser_record.add_argument('--interval', type=float, default=cfg_int, help="Polling interval (secs).")
-    parser_record.add_argument('--device', type=str, default=cfg_dev, help="Audio input device for FFmpeg.")
-    parser_record.add_argument('--ffmpeg-path', type=str, default=cfg_ffp, help="Path to FFmpeg.")
-    parser_record.add_argument('--skip-existing-file', action=argparse.BooleanOptionalAction, default=cfg_skip, help="Skip if output filename already exists.")
-    parser_record.add_argument('--min-duration', type=int, default=cfg_min_d, help="Min track duration to record (secs).")
-    parser_record.add_argument('--recording-buffer', type=float, default=cfg_rec_b, help="Time buffer for FFmpeg -t (secs).")
-    parser_record.add_argument('--organize', action=argparse.BooleanOptionalAction, default=cfg_org, help="Organize into Artist/Album folders.")
-    parser_record.set_defaults(func=execute_record_command)
+    # Setup directories
+    out_dir = resolve_path(cfg['Recording'].get('output_directory', 'Recordings'))
+    naming_format = cfg['Naming'].get('naming_format', '{track_no}. {artist} - {title}')
 
-    # --- List Devices Subcommand Parser ---
-    parser_list_devices = subparsers.add_parser("list-devices", help="List audio input devices.", aliases=['lsdev'], formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser_list_devices.add_argument('--ffmpeg-path', type=str, default=cfg_ffp, help="Path to FFmpeg.")
-    parser_list_devices.set_defaults(func=execute_list_devices_command)
-
-    # --- Test Auth Subcommand Parser ---
-    parser_test_auth = subparsers.add_parser("test-auth", help="Test Spotify API authentication.", aliases=['auth'], formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser_test_auth.set_defaults(func=execute_test_auth_command)
-    
-    # --- Handle default command behavior ---
-    args_list_to_parse = sys.argv[1:]
-    if not args_list_to_parse or (args_list_to_parse[0].startswith('-') and not any(cmd in args_list_to_parse for cmd in subparsers.choices.keys())):
-        console.print("[italic yellow]No command specified, defaulting to 'record' command.[/italic yellow]\n")
-        args_list_to_parse.insert(0, 'record') 
-    
+    # Validate output directory
     try:
-        args = parser.parse_args(args_list_to_parse)
-        if not hasattr(args, 'func'): # If parsing succeeded but no function was set (e.g. only script name given, no default logic triggered)
-            if not args.command_name: # Truly no command
-                 args = parser.parse_args(['record'] + args_list_to_parse) # Try again with record prepended
-            else: # A command was given but no func set - should not happen with set_defaults
-                 parser.print_help(); return
-    except SystemExit as e: return
+        out_dir.mkdir(parents=True, exist_ok=True)
+        test_file = out_dir / ".perms_check"
+        test_file.touch()
+        test_file.unlink()
+        logging.info(f"Output directory ready: {out_dir}")
+    except Exception as e:
+        console.print(f"[bold red]Output Path Unwritable: {e}[/bold red]")
+        sys.exit(1)
 
-    # --- Finalization Worker Thread ---
-    worker = None
-    # Resolve paths based on the parsed args for the specific command (or defaults if 'record' was implicit)
-    final_ffmpeg_path = args.ffmpeg_path if hasattr(args, 'ffmpeg_path') else cfg_ffp
-    final_log_dir = args.dir if hasattr(args, 'dir') else cfg_dir
-    resolved_log_file_path_for_worker = final_log_dir / 'spytorec_metadata.jsonl'
+    # Hardware initialisation
+    hw_ready = cfg.get('Recording', 'ffmpeg_name', fallback='') != ''
 
-    if args.command_name == "record":
-        try: resolved_log_file_path_for_worker.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as e: console.print(f"[red]Error ensuring log dir '{resolved_log_file_path_for_worker.parent}': {e}.[/red]")
-        worker = threading.Thread(target=finalization_worker_function, args=(final_ffmpeg_path, resolved_log_file_path_for_worker), daemon=True)
-        worker.start()
+    if hw_ready:
+        console.print("[yellow]Found existing config. Press SPACE in 5s to re-scan hardware...[/yellow]")
+        start_time = time.time()
+        rescan = False
 
-    # --- Execute Command ---
+        while time.time() - start_time < 5:
+            if os.name == 'nt' and msvcrt.kbhit():
+                if msvcrt.getch() == b' ':
+                    rescan = True
+                    break
+            elif os.name != 'nt':
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    c = sys.stdin.read(1)
+                    if c == ' ':
+                        rescan = True
+                        break
+            time.sleep(0.1)
+
+        if rescan:
+            hw_name, hw_idx, hw_sr, hw_ch = discover_hardware(args.ffmpeg)
+        else:
+            hw_name = cfg['Recording'].get('ffmpeg_name')
+            hw_idx = int(cfg['Recording'].get('device_id'))
+            hw_sr = int(cfg['Recording'].get('sample_rate'))
+            hw_ch = int(cfg['Recording'].get('channels'))
+    else:
+        hw_name, hw_idx, hw_sr, hw_ch = discover_hardware(args.ffmpeg)
+
+    # Spotify initialisation
+    client_id = cfg['SpotifyAPI'].get('SPOTIPY_CLIENT_ID')
+    client_secret = cfg['SpotifyAPI'].get('SPOTIPY_CLIENT_SECRET')
+
+    if not client_id or not client_secret:
+        console.print("[red]Spotify Credentials Missing from config.ini![/red]")
+        console.print("Please add your Spotify API credentials to config.ini under [SpotifyAPI].")
+        sys.exit(1)
+
     try:
-        if hasattr(args, 'func'):
-            args.func(args, config) # Pass full config if subcommand function needs other sections
-        else: # Fallback if command resolution was incomplete
-            parser.print_help()
-            console.print("\n[red]Please specify a valid command.[/red]")
-    except KeyboardInterrupt: 
-        console.print("\n[bold red]Global Keyboard Interrupt. Shutting down...[/bold red]")
-    except Exception as e: 
-        console.print(f"\n[bold red]Critical unhandled error in main execution: {e}[/bold red]")
-        console.print(f"[grey70]{escape(traceback.format_exc())}[/grey70]")
+        sp = Spotify(auth_manager=SpotifyOAuth(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=SPOTIPY_REDIRECT_URI,
+            scope=SPOTIPY_SCOPE,
+            open_browser=True
+        ))
+        console.print("[green]Spotify authentication successful![/green]")
+    except Exception as e:
+        console.print(f"[red]Spotify authentication failed: {e}[/red]")
+        sys.exit(1)
+
+    # Start background workers
+    workers = []
+    for target in [watchdog_worker]:
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        workers.append(t)
+
+    # Setup FFmpeg logging
+    ff_log_ptr = subprocess.DEVNULL
+    ff_log_file = None
+
+    if cfg['Diagnostics'].getboolean('enable_logging'):
+        ff_log_file = resolve_path(cfg['Diagnostics'].get('ffmpeg_log_file', 'spyto_ffmpeg.log'))
+        try:
+            ff_log_ptr = open(ff_log_file, "a", encoding='utf-8')
+        except Exception as e:
+            logging.warning(f"Could not open FFmpeg log file: {e}")
+            ff_log_ptr = subprocess.DEVNULL
+
+    # Main loop variables
+    current_track = None
+    current_id = None
+    temp_file = None
+    last_error_time = 0
+    error_recovery_delay = 2
+
+    # Determine platform-specific FFmpeg input format
+    ffmpeg_input_fmt = get_ffmpeg_input_format()
+
+    set_state(STATE_MONITORING)
+
+    try:
+        with Live(Panel(Text("Waiting for Spotify...", style="yellow")), refresh_per_second=10) as live:
+            while not stop_event.is_set():
+                try:
+                    # Get playback info with retry
+                    playback = spotify_with_retry(sp)
+
+                    if playback and playback.get('is_playing'):
+                        track = playback['item']
+                        track_id = track['id']
+
+                        # Handle track change
+                        if track_id != current_id:
+                            # Stop current recording if any
+                            if ffmpeg_process:
+                                set_state(STATE_SWITCHING)
+                                stop_monitor_stream()
+
+                                with ffmpeg_lock:
+                                    safely_stop_ffmpeg(ffmpeg_process)
+                                    ffmpeg_process = None
+
+                                if temp_file and current_track:
+                                    finalize(temp_file, out_dir, current_track, naming_format)
+                                    temp_file = None
+
+                            # Start new recording
+                            safe_mode = cfg['Recording'].getboolean('force_safe_mode')
+                            sr = 44100 if safe_mode else hw_sr
+                            ch = 2 if safe_mode else hw_ch
+                            bit_depth = cfg['Recording'].get('bit_depth', '24')
+
+                            # Map bit depth to sample format
+                            fmt_map = {'16': 's16', '24': 's32', '32': 's32'}
+                            sample_fmt = fmt_map.get(bit_depth, 's16')
+
+                            # Start audio monitor
+                            if not start_monitor(hw_idx, sr, ch):
+                                set_state(STATE_ERROR, "Audio Monitor Failed")
+                                time.sleep(3)
+                                continue
+
+                            # Create temp file
+                            temp_file = out_dir / f".tmp_{int(time.time())}.flac"
+
+                            # Build cross-platform FFmpeg command
+                            device_arg = get_ffmpeg_device_arg(hw_name)
+                            cmd = [
+                                args.ffmpeg, '-y',
+                                '-f', ffmpeg_input_fmt,
+                                '-i', device_arg,
+                                '-ac', str(ch),
+                                '-ar', str(sr),
+                                '-sample_fmt', sample_fmt,
+                                '-c:a', 'flac',
+                                '-compression_level', '8',
+                                str(temp_file)
+                            ]
+
+                            # Start FFmpeg
+                            try:
+                                with ffmpeg_lock:
+                                    ffmpeg_process = subprocess.Popen(
+                                        cmd,
+                                        stdin=subprocess.PIPE,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=ff_log_ptr
+                                    )
+
+                                watchdog_proc_ref = ffmpeg_process
+                                watchdog_file_ref = temp_file
+                                current_track = track
+                                current_id = track_id
+                                current_track_id_ref = track_id
+
+                                set_state(STATE_RECORDING)
+                                logging.info(f"Started recording: {track['name']} - {track['artists'][0]['name']}")
+
+                            except Exception as e:
+                                logging.error(f"Failed to start FFmpeg: {e}")
+                                if temp_file and temp_file.exists():
+                                    try:
+                                        temp_file.unlink()
+                                    except Exception:
+                                        pass
+                                temp_file = None
+                                set_state(STATE_ERROR, f"FFmpeg error: {e}")
+                                continue
+
+                        # Build UI display
+                        if temp_file and temp_file.exists():
+                            file_size = round(temp_file.stat().st_size / (1024 ** 2), 2)
+                        else:
+                            file_size = 0.0
+
+                        progress = playback.get('progress_ms', 0)
+                        duration = track.get('duration_ms', 1)
+
+                        dashboard = Table.grid(expand=True)
+
+                        rec_indicator = "[bold red]REC \u25cf[/bold red]" if get_state() == STATE_RECORDING else "[yellow]WAIT[/yellow]"
+                        dashboard.add_row(Text.from_markup(f"{rec_indicator}  [bold cyan]{track['name']}[/bold cyan]"))
+                        dashboard.add_row(Text(f"Artist: {track['artists'][0]['name']}", style="grey70"))
+                        dashboard.add_row(Text(f"Album: {track['album']['name']}", style="grey70"))
+
+                        dashboard.add_row(ProgressBar(total=duration, completed=progress, width=None))
+
+                        if failed_recordings:
+                            dashboard.add_row(Text(f"\u26a0\ufe0f Failed recordings: {len(failed_recordings)}", style="bold red"))
+
+                        dashboard.add_section()
+
+                        if cfg['UI'].getboolean('show_status_strip'):
+                            safe_mode_active = cfg['Recording'].getboolean('force_safe_mode')
+                            safe_tag = "[bold yellow](SAFE MODE) [/bold yellow]" if safe_mode_active else ""
+                            minutes = int(progress / 60000)
+                            seconds = int((progress / 1000) % 60)
+                            time_str = f"{minutes:02d}:{seconds:02d}"
+
+                            status_items = []
+                            if cfg['QualityDisplay'].getboolean('show_sample_rate'):
+                                status_items.append(f"{sr}Hz")
+                            if cfg['QualityDisplay'].getboolean('show_bit_depth'):
+                                status_items.append(f"{bit_depth}-bit")
+                            if cfg['QualityDisplay'].getboolean('show_channels'):
+                                status_items.append(f"{ch}ch")
+
+                            tech_info = " | ".join(status_items) if status_items else ""
+                            status_line = f"{safe_tag}{tech_info} | {time_str} | {file_size}MB"
+                            dashboard.add_row(Text.from_markup(f"\u2699\ufe0f {status_line}"))
+
+                        if cfg['QualityDisplay'].getboolean('show_lr_meters'):
+                            show_peak = cfg['QualityDisplay'].getboolean('show_peak_hold')
+                            dashboard.add_row(Text.from_markup(f"L {build_gradient_bar(smoothed_rms_l, peak_l, show_peak=show_peak)}"))
+                            dashboard.add_row(Text.from_markup(f"R {build_gradient_bar(smoothed_rms_r, peak_r, show_peak=show_peak)}"))
+
+                            if mono_warning_frames > 30:
+                                dashboard.add_row(Text("[yellow]\u26a0\ufe0f Warning: Possible mono input detected[/yellow]"))
+
+                        health = get_health_indicator(peak_l)
+                        dashboard.add_row(Text.from_markup(f"Signal Health: {health}"))
+
+                        if cfg['Debug'].getboolean('show_debug_overlay'):
+                            dashboard.add_section()
+                            pid = ffmpeg_process.pid if ffmpeg_process else 'None'
+                            state = get_state()
+                            dashboard.add_row(Text.from_markup(
+                                f"[dim]PID: {pid} | State: {state} | L={raw_l:.3f} R={raw_r:.3f} | Mono frames: {mono_warning_frames}[/dim]"
+                            ))
+
+                        dashboard.add_section()
+
+                        if cfg['Diagnostics'].getboolean('enable_logging'):
+                            logs = get_tail_logs(3)
+                            if logs:
+                                dashboard.add_row(Panel(Text.from_markup(f"[dim]{logs}[/dim]"), title="System Log", border_style="dim"))
+
+                        live.update(Panel(dashboard, title=f"SpytoRec v{SCRIPT_VERSION} - Recording", border_style="green"))
+
+                    else:
+                        # Not playing - cleanup if needed
+                        if ffmpeg_process:
+                            set_state(STATE_STOPPING)
+                            stop_monitor_stream()
+
+                            with ffmpeg_lock:
+                                safely_stop_ffmpeg(ffmpeg_process)
+                                ffmpeg_process = None
+
+                            if temp_file and current_track:
+                                if finalize(temp_file, out_dir, current_track, naming_format):
+                                    logging.info(f"Saved: {current_track['name']}")
+                                    console.print(f"[green]\u2713 Saved: {current_track['name']}[/green]")
+                                else:
+                                    failed_recordings.append(current_track['name'])
+                                    if len(failed_recordings) > 5:
+                                        failed_recordings.pop(0)
+                                    console.print(f"[red]\u2717 Failed to save: {current_track['name']}[/red]")
+
+                            temp_file = None
+                            current_track = None
+                            current_id = None
+                            current_track_id_ref = None
+                            set_state(STATE_IDLE)
+
+                        idle_dashboard = Table.grid(expand=True)
+                        idle_dashboard.add_row(Text("\U0001f3b5 Spotify Paused", style="bold yellow"))
+                        idle_dashboard.add_row(Text("Waiting for playback to start...", style="grey70"))
+
+                        if failed_recordings:
+                            idle_dashboard.add_section()
+                            idle_dashboard.add_row(Text(f"\u26a0\ufe0f Failed recordings: {len(failed_recordings)}", style="bold red"))
+
+                        if cfg['Diagnostics'].getboolean('enable_logging'):
+                            idle_dashboard.add_section()
+                            logs = get_tail_logs(3)
+                            if logs:
+                                idle_dashboard.add_row(Panel(Text.from_markup(f"[dim]{logs}[/dim]"), title="System Log", border_style="dim"))
+
+                        live.update(Panel(idle_dashboard, title=f"SpytoRec v{SCRIPT_VERSION}", border_style="blue"))
+
+                    time.sleep(0.1)
+
+                except SpotifyException as e:
+                    logging.error(f"Spotify API error: {e}")
+                    if time.time() - last_error_time > error_recovery_delay:
+                        set_state(STATE_ERROR, f"Spotify error: {e}")
+                        last_error_time = time.time()
+                        time.sleep(5)
+                        set_state(STATE_RECOVERING)
+                        time.sleep(2)
+                        set_state(STATE_MONITORING)
+                    else:
+                        time.sleep(1)
+
+                except Exception as e:
+                    logging.exception(f"Main loop error: {e}")
+                    if time.time() - last_error_time > error_recovery_delay:
+                        set_state(STATE_ERROR, str(e))
+                        last_error_time = time.time()
+                        time.sleep(5)
+                        set_state(STATE_RECOVERING)
+                        time.sleep(2)
+                        set_state(STATE_MONITORING)
+                    else:
+                        time.sleep(1)
+
     finally:
-        console.print("\n[yellow]Initiating shutdown sequence...[/yellow]")
-        stop_worker_event.set() 
+        if ff_log_ptr != subprocess.DEVNULL:
+            try:
+                ff_log_ptr.close()
+            except Exception:
+                pass
 
-        if current_ffmpeg_process and current_ffmpeg_process.poll() is None: 
-            console.print("[yellow]Main thread: Active recording at shutdown. Submitting for finalization...[/yellow]")
-            submit_to_finalization_queue("Shutdown signal to main thread")
-        
-        if worker and worker.is_alive():
-            q_sz = finalization_task_queue.qsize()
-            if q_sz > 0: console.print(f"[grey50]Waiting for finalization queue ({q_sz} tasks)...[/grey50]")
-            else: console.print("[grey50]Finalization queue empty or worker not for this command.[/grey50]")
-            finalization_task_queue.join() 
-            if q_sz > 0: console.print("[green]Finalization queue processed.[/green]")
-            worker.join(timeout=30) 
-            if worker.is_alive(): console.print("[red]Finalization worker did not stop cleanly.[/red]")
-            else: console.print("[green]Finalization worker stopped.[/green]")
-        elif args.command_name == "record" and not worker : # Should not happen if record command was selected
-             console.print("[yellow]Worker thread was expected for 'record' but not started.[/yellow]")
-        console.print("\nSpytoRec shut down gracefully.")
+        for worker in workers:
+            worker.join(timeout=2)
+
+        if failed_recordings:
+            console.print(f"\n[yellow]Recording session completed with {len(failed_recordings)} failed tracks[/yellow]")
+        else:
+            console.print("\n[green]Recording session completed successfully![/green]")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        stop_event.set()
+        console.print("\n[yellow]Shutdown complete.[/yellow]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(f"\n[red]Fatal error: {e}[/red]")
+        logging.exception("Fatal error")
+        sys.exit(1)
