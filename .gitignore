@@ -32,6 +32,11 @@ Recordings/ # Users' output directory, should not be in repo
 spytorec_metadata.jsonl # Log file, specific to user's recordings
 *.rewrite_temp # Temporary files from rewrite process
 *_cover.jpg # Temporary cover art files
+spyto_system.log # Runtime system log
+spyto_system.log.* # Rotated system logs
+spyto_ffmpeg.log # FFmpeg process log
+spyto.lock # Process lock file
+.tmp_*.flac # Temporary recording files
 
 # IDE / Editor specific
 .vscode/
