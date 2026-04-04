@@ -34,6 +34,11 @@ Author: @Darkphoenix
 GitHub: https://github.com/Danidukiyu
 Version: 8.0.0
 
+Contributors:
+    • @electrodics-ship-it — contributed the V8.0.0 optimized build (issue #6):
+      real-time audio metering, state machine, watchdog, rotating logs,
+      24-bit FLAC support, and cross-platform improvements.
+
 License:
     This project is licensed under the MIT License.
     Refer to the LICENSE file in the repository for full details.

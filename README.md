@@ -151,6 +151,14 @@ Fork the repo, give it a star, and help build more useful tools for personal mus
 
 ---
 
+## 🙏 Contributors
+
+| Contributor | Contribution |
+|---|---|
+| [@electrodics-ship-it](https://github.com/electrodics-ship-it) | V8.0.0 optimized build — real-time audio metering, state machine, watchdog, rotating logs, 24-bit FLAC, and cross-platform improvements ([#6](https://github.com/Danidukiyu/spytorec/issues/6)) |
+
+---
+
 ## 📜 License
 
 This project is licensed under **MIT License**  
