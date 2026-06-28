@@ -330,7 +330,7 @@ def load_config() -> configparser.ConfigParser:
 
     if modified:
         try:
-            with file_lock(CONFIG_FILE_PATH):
+            with file_lock(LOCK_FILE_PATH):
                 with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
                     cfg.write(f)
         except Exception as e:
@@ -661,28 +661,30 @@ def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
         count = 1
 
         with meter_lock:
-            sorted_idx = sorted(active_idx, key=lambda x: meter_peaks.get(x, 0), reverse=True)
-            for i in sorted_idx:
-                if meter_peaks.get(i, 0) > AUDIO_THRESHOLD:
-                    sr = int(devices[i]['default_samplerate'])
-                    ch = devices[i]['max_input_channels']
-                    level = min(40, int(meter_data.get(i, 0) * 40))
-
-                    t.add_row(
-                        f"[{count}]",
-                        devices[i]['name'],
-                        f"{sr}Hz | {ch}ch",
-                        "\u2588" * level
-                    )
-                    rows[count] = dict(devices[i])
-                    rows[count]['idx'] = i
-                    count += 1
+            # Include all active devices, not just those currently making sound
+            for i in active_idx:
+                sr = int(devices[i]['default_samplerate'])
+                ch = devices[i]['max_input_channels']
+                level = min(40, int(meter_data.get(i, 0) * 40))
+                
+                # Dim the row if no audio is detected
+                style = "dim" if meter_peaks.get(i, 0) <= AUDIO_THRESHOLD else "default"
+                
+                t.add_row(
+                    f"[{count}]",
+                    f"[{style}]{devices[i]['name']}[/{style}]",
+                    f"[{style}]{sr}Hz | {ch}ch[/{style}]",
+                    f"[{style}]" + "\u2588" * level + f"[/{style}]"
+                )
+                rows[count] = dict(devices[i])
+                rows[count]['idx'] = i
+                count += 1
 
         return Panel(t, subtitle=f"Selection: {buf}"), rows
 
     console.print("[yellow]Press number keys to select device, Enter to confirm[/yellow]")
 
-    with Live(build_hw_table()[0], refresh_per_second=10) as live:
+    with Live(build_hw_table()[0], refresh_per_second=10, screen=True) as live:
         while not selected:
             try:
                 panel, rows = build_hw_table()
@@ -741,7 +743,7 @@ def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
     cfg.set('Recording', 'channels', str(selected['max_input_channels']))
 
     try:
-        with file_lock(CONFIG_FILE_PATH):
+        with file_lock(LOCK_FILE_PATH):
             with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
                 cfg.write(f)
     except Exception as e:
@@ -1035,6 +1037,7 @@ def main():
         logging.info(f"Output directory ready: {out_dir}")
     except Exception as e:
         console.print(f"[bold red]Output Path Unwritable: {e}[/bold red]")
+        time.sleep(5)
         sys.exit(1)
 
     # Hardware initialisation
@@ -1075,6 +1078,7 @@ def main():
     if not client_id or not client_secret:
         console.print("[red]Spotify Credentials Missing from config.ini![/red]")
         console.print("Please add your Spotify API credentials to config.ini under [SpotifyAPI].")
+        time.sleep(5)
         sys.exit(1)
 
     try:
@@ -1085,9 +1089,12 @@ def main():
             scope=SPOTIPY_SCOPE,
             open_browser=True
         ))
+        # Test auth
+        sp.current_user()
         console.print("[green]Spotify authentication successful![/green]")
     except Exception as e:
-        console.print(f"[red]Spotify authentication failed: {e}[/red]")
+        console.print(f"[red]Failed to authenticate with Spotify: {e}[/red]")
+        time.sleep(5)
         sys.exit(1)
 
     # Start background workers
