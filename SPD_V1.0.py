@@ -74,6 +74,8 @@ try:
     import sounddevice as sd
     import numpy as np
     from mutagen.flac import FLAC, Picture
+    from mutagen.mp3 import MP3
+    from mutagen.id3 import ID3, TIT2, TPE1, TALB, TYER, TRCK, APIC
     from spotipy import Spotify
     from spotipy.oauth2 import SpotifyOAuth
     from spotipy.exceptions import SpotifyException
@@ -805,7 +807,7 @@ def watchdog_worker() -> None:
             logging.error(f"Watchdog error: {e}")
 
 
-def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: str) -> bool:
+def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: str, output_format: str = 'flac') -> bool:
     """Tags and moves the recorded file with integrity checking."""
     if not temp_file or not temp_file.exists():
         return False
@@ -844,25 +846,34 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
             final_name = f"{track_no}. {artist} - {title}"
 
         final_name = clean_filename(final_name)
-        final_path = out_dir / f"{final_name}.flac"
+        final_path = out_dir / f"{final_name}.{output_format}"
 
         # Handle existing files
         if final_path.exists():
             if not cfg['Recording'].getboolean('overwrite_existing'):
                 timestamp = int(time.time())
-                final_path = out_dir / f"{final_name}_{timestamp}.flac"
+                final_path = out_dir / f"{final_name}_{timestamp}.{output_format}"
                 logging.info(f"File exists, created: {final_path.name}")
             else:
                 logging.info(f"Overwriting existing file: {final_path.name}")
 
-        # Load and tag the FLAC file
-        audio = FLAC(temp_file)
-
-        audio['title'] = track_info['name']
-        audio['artist'] = track_info['artists'][0]['name']
-        audio['album'] = track_info['album']['name']
-        audio['date'] = year
-        audio['tracknumber'] = track_no
+        if output_format == 'mp3':
+            audio = MP3(temp_file, ID3=ID3)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.add(TIT2(encoding=3, text=track_info['name']))
+            audio.tags.add(TPE1(encoding=3, text=track_info['artists'][0]['name']))
+            audio.tags.add(TALB(encoding=3, text=track_info['album']['name']))
+            audio.tags.add(TYER(encoding=3, text=year))
+            audio.tags.add(TRCK(encoding=3, text=track_no))
+        else:
+            # Load and tag the FLAC file
+            audio = FLAC(temp_file)
+            audio['title'] = track_info['name']
+            audio['artist'] = track_info['artists'][0]['name']
+            audio['album'] = track_info['album']['name']
+            audio['date'] = year
+            audio['tracknumber'] = track_no
 
         # Add album art with content-type and size validation
         if not cfg['Recording'].getboolean('force_safe_mode'):
@@ -888,12 +899,23 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
                                     break
                             if img_data:
                                 mime = content_type.split(';')[0].strip()
-                                picture = Picture()
-                                picture.data = img_data
-                                picture.type = 3
-                                picture.mime = mime
-                                picture.desc = "Cover Art"
-                                audio.add_picture(picture)
+                                if output_format == 'mp3':
+                                    audio.tags.add(
+                                        APIC(
+                                            encoding=3,
+                                            mime=mime,
+                                            type=3,
+                                            desc='Cover',
+                                            data=img_data
+                                        )
+                                    )
+                                else:
+                                    picture = Picture()
+                                    picture.data = img_data
+                                    picture.type = 3
+                                    picture.mime = mime
+                                    picture.desc = "Cover Art"
+                                    audio.add_picture(picture)
                                 logging.debug("Added album art")
                         else:
                             logging.warning(f"Unexpected content type for album art: {content_type}")
@@ -1027,6 +1049,9 @@ def main():
     # Setup directories
     out_dir = resolve_path(cfg['Recording'].get('output_directory', 'Recordings'))
     naming_format = cfg['Naming'].get('naming_format', '{track_no}. {artist} - {title}')
+    output_format = cfg['Recording'].get('output_format', 'flac').lower()
+    if output_format not in ['flac', 'mp3']:
+        output_format = 'flac'
 
     # Validate output directory
     try:
@@ -1151,7 +1176,7 @@ def main():
                                     ffmpeg_process = None
 
                                 if temp_file and current_track:
-                                    finalize(temp_file, out_dir, current_track, naming_format)
+                                    finalize(temp_file, out_dir, current_track, naming_format, output_format)
                                     temp_file = None
 
                             # Start new recording
@@ -1171,21 +1196,32 @@ def main():
                                 continue
 
                             # Create temp file
-                            temp_file = out_dir / f".tmp_{int(time.time())}.flac"
+                            temp_file = out_dir / f".tmp_{int(time.time())}.{output_format}"
 
                             # Build cross-platform FFmpeg command
                             device_arg = get_ffmpeg_device_arg(hw_name)
                             cmd = [
-                                args.ffmpeg, '-y',
+                                args.ffmpeg, '-y', '-nostdin',
                                 '-f', ffmpeg_input_fmt,
+                                '-thread_queue_size', '512',
                                 '-i', device_arg,
                                 '-ac', str(ch),
-                                '-ar', str(sr),
-                                '-sample_fmt', sample_fmt,
-                                '-c:a', 'flac',
-                                '-compression_level', '8',
-                                str(temp_file)
+                                '-ar', str(sr)
                             ]
+                            
+                            if output_format == 'mp3':
+                                cmd.extend([
+                                    '-c:a', 'libmp3lame',
+                                    '-b:a', '320k',
+                                    str(temp_file)
+                                ])
+                            else:
+                                cmd.extend([
+                                    '-sample_fmt', sample_fmt,
+                                    '-c:a', 'flac',
+                                    '-compression_level', '8',
+                                    str(temp_file)
+                                ])
 
                             # Start FFmpeg
                             try:
@@ -1298,7 +1334,7 @@ def main():
                                 ffmpeg_process = None
 
                             if temp_file and current_track:
-                                if finalize(temp_file, out_dir, current_track, naming_format):
+                                if finalize(temp_file, out_dir, current_track, naming_format, output_format):
                                     logging.info(f"Saved: {current_track['name']}")
                                     console.print(f"[green]\u2713 Saved: {current_track['name']}[/green]")
                                 else:
