@@ -21,10 +21,10 @@
 - 🎯 Track Splitting via Spotify API
 - 🎼 Metadata Embedding: title, artist, album, and cover art
 - ⚙️ Background Finalization for smooth capture
-- 📁 File Organization: Artist/Album/Track
-- 🧹 Audio Header Cleanup
-- 🔧 Config File and CLI Argument Support
-- 💬 Rich Terminal UI (`rich`)
+- 📁 File Organization: Automatically sort by Artist/Album
+- 🛡️ Duplicate Detection & Auto-Skip via Blocklist
+- 💬 Rich Terminal UI with Cross-Platform Keyboard Shortcuts
+- 🔔 Webhook Notifications for session monitoring
 - 🖥️ Cross-Platform: Windows, macOS, Linux
 
 ---
@@ -46,7 +46,7 @@
    ```
 5. Set Spotify output to **CABLE Input**, and run:
    ```bash
-   python spytorec.py
+   python SpytoRec_v8.0.0.py
    ```
 
 ---
@@ -68,7 +68,7 @@
    ```
 6. Run the script:
    ```bash
-   python spytorec.py
+   python SpytoRec_v8.0.0.py
    ```
 
 ---
@@ -89,7 +89,7 @@
    ```bash
    git clone https://github.com/YOUR_USERNAME/SpytoRec.git
    cd SpytoRec
-   python3 spytorec.py
+   python3 SpytoRec_v8.0.0.py
    ```
 
 ---
@@ -97,7 +97,7 @@
 ## 🛠️ Usage & CLI
 
 ```bash
-python spytorec.py [COMMAND] [OPTIONS]
+python SpytoRec_v8.0.0.py [COMMAND] [OPTIONS]
 ```
 
 ### ▶️ `record` (or default)
@@ -114,10 +114,10 @@ Tests Spotify API credentials and shows current playback info.
 ## 🧪 Example Commands
 
 ```bash
-python spytorec.py                      # default run with config.ini
-python spytorec.py record --format flac --organize
-python spytorec.py list-devices
-python spytorec.py test-auth
+python SpytoRec_v8.0.0.py                      # default run with config.ini
+python SpytoRec_v8.0.0.py record --format flac --organize
+python SpytoRec_v8.0.0.py list-devices
+python SpytoRec_v8.0.0.py test-auth
 ```
 
 ---

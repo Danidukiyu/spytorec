@@ -56,12 +56,14 @@ import argparse
 import subprocess
 import re
 import queue
+from collections import deque
 import threading
 import configparser
 import requests
 import logging
 import platform
 import signal
+import shutil
 import atexit
 from contextlib import contextmanager
 from datetime import datetime
@@ -107,6 +109,38 @@ else:
     import select
     HAS_WIN32 = False
 
+class KBHit:
+    """Cross-platform keyboard listener."""
+    def __init__(self):
+        if os.name != 'nt':
+            self.fd = sys.stdin.fileno()
+            self.old_term = termios.tcgetattr(self.fd)
+            
+    def set_normal_term(self):
+        if os.name != 'nt':
+            termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.old_term)
+
+    def set_cbreak(self):
+        if os.name != 'nt':
+            tty.setcbreak(self.fd)
+
+    def kbhit(self):
+        if os.name == 'nt':
+            return msvcrt.kbhit()
+        else:
+            dr,dw,de = select.select([sys.stdin], [], [], 0)
+            return dr != []
+
+    def getch(self):
+        if os.name == 'nt':
+            c = msvcrt.getch()
+            try:
+                return c.decode('utf-8').lower()
+            except Exception:
+                return ''
+        else:
+            return sys.stdin.read(1).lower()
+
 # --- Global Constants ---
 SCRIPT_VERSION = "8.0.0"
 SPOTIPY_REDIRECT_URI = 'http://127.0.0.1:8888/callback'
@@ -123,14 +157,15 @@ MAX_COVER_ART_BYTES = 2 * 1024 * 1024  # 2 MB safety cap for album art
 console = Console()
 
 # --- Internal State Machine Definitions ---
-STATE_INIT = "INITIALISING"
-STATE_IDLE = "IDLE"
-STATE_MONITORING = "MONITORING"
-STATE_RECORDING = "RECORDING"
-STATE_SWITCHING = "SWITCHING_TRACK"
-STATE_STOPPING = "STOPPING"
-STATE_ERROR = "ERROR"
-STATE_RECOVERING = "RECOVERING"
+STATE_INIT = 'Init'
+STATE_MONITORING = 'Monitoring'
+STATE_SWITCHING = 'Switching Tracks'
+STATE_RECORDING = 'Recording'
+STATE_STOPPING = 'Stopping'
+STATE_RECOVERING = 'Recovering'
+STATE_ERROR = 'Error'
+STATE_IDLE = 'Idle'
+STATE_SKIPPED = 'Skipped'
 
 VALID_STATE_TRANSITIONS = {
     STATE_INIT: {STATE_IDLE, STATE_ERROR},
@@ -148,7 +183,7 @@ state_lock = threading.Lock()
 meter_lock = threading.Lock()
 current_state = STATE_INIT
 last_error_msg = ""
-failed_recordings = []
+failed_recordings = deque(maxlen=5)
 error_count = 0
 last_heartbeat = time.time()
 
@@ -285,7 +320,13 @@ DEFAULT_CONFIG = {
         'show_debug_overlay': 'false', 'watchdog_enabled': 'true'
     },
     'Naming': {
-        'naming_format': '{track_no}. {artist} - {title}'
+        'naming_format': '{track_no}. {artist} - {title}',
+        'organize_by': 'artist/album'
+    },
+    'Webhooks': {
+        'discord_url': '',
+        'notify_on_track_saved': 'true',
+        'notify_on_session_end': 'true'
     },
     'SpotifyAPI': {
         'SPOTIPY_CLIENT_ID': '', 'SPOTIPY_CLIENT_SECRET': ''
@@ -390,6 +431,9 @@ def setup_logging(config: configparser.ConfigParser) -> None:
 cfg = load_config()
 setup_logging(cfg)
 
+# Cache frequently-accessed config values for audio callback hot path
+_smooth_meter = cfg['UI'].getboolean('smooth_meter_animation')
+
 
 # --- 2. HELPER FUNCTIONS & LOGIC ---
 
@@ -427,6 +471,20 @@ def get_state() -> str:
         return current_state
 
 
+def handle_error_recovery(error, last_error_time, error_recovery_delay):
+    """Common error recovery logic for main loop exception handlers."""
+    if time.time() - last_error_time > error_recovery_delay:
+        set_state(STATE_ERROR, str(error))
+        time.sleep(5)
+        set_state(STATE_RECOVERING)
+        time.sleep(2)
+        set_state(STATE_MONITORING)
+        return time.time()
+    else:
+        time.sleep(1)
+        return last_error_time
+
+
 def clean_filename(name: str) -> str:
     """Strips illegal filesystem characters from filenames (cross-platform safe)."""
     if not name:
@@ -439,7 +497,7 @@ def clean_filename(name: str) -> str:
 
 
 def get_tail_logs(n: int = 4) -> str:
-    """Safely retrieves end of log file for UI display."""
+    """Safely retrieves end of log file for UI display by seeking from the end."""
     if not cfg['Diagnostics'].getboolean('enable_logging'):
         return "Logging Disabled"
 
@@ -448,14 +506,66 @@ def get_tail_logs(n: int = 4) -> str:
         if not path.exists():
             return "Waiting for logs..."
 
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            lines = f.readlines()
-            return "".join(lines[-n:]).strip()
+        with open(path, 'rb') as f:
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            if file_size == 0:
+                return "Waiting for logs..."
+            # Read last 4KB — more than enough for a few log lines
+            read_size = min(file_size, 4096)
+            f.seek(-read_size, 2)
+            data = f.read().decode('utf-8', errors='replace')
+            lines = [l.strip() for l in data.split('\n') if l.strip()]
+            return '\n'.join(lines[-n:])
+    except Exception:
+        return "Waiting for logs..."
+
+
+def load_blocklist() -> List[str]:
+    """Loads the blocklist.txt file into a list of rules."""
+    blocklist = []
+    path = resolve_path('blocklist.txt')
+    if path.exists():
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                blocklist = [line.strip().lower() for line in f if line.strip() and not line.startswith('#')]
+        except Exception as e:
+            logging.error(f"Failed to load blocklist: {e}")
+    return blocklist
+
+def is_track_blocked(track: Dict, blocklist: List[str]) -> Tuple[bool, str]:
+    """Checks if a track matches any blocklist rule."""
+    if not blocklist:
+        return False, ""
+    
+    track_id = track.get('id', '').lower()
+    title = track.get('name', '').lower()
+    artist = track.get('artists', [{}])[0].get('name', '').lower()
+
+    for rule in blocklist:
+        if rule.startswith('id:') and rule[3:].strip() == track_id:
+            return True, f"Matched ID rule: {rule}"
+        elif rule.startswith('artist:') and rule[7:].strip() in artist:
+            return True, f"Matched Artist rule: {rule}"
+        elif rule.startswith('title:') and rule[6:].strip() in title:
+            return True, f"Matched Title rule: {rule}"
+            
+    return False, ""
+
+def send_webhook(message: str) -> None:
+    """Sends a notification to a Discord webhook if configured."""
+    webhook_url = cfg['Webhooks'].get('discord_url', '').strip()
+    if not webhook_url:
+        return
+        
+    try:
+        payload = {"content": message}
+        requests.post(webhook_url, json=payload, timeout=5)
     except Exception as e:
-        return f"Log Error: {e}"
+        logging.error(f"Failed to send webhook: {e}")
 
 
-def cleanup_resources():
+def get_health_indicator(peak_level: float) -> str:
     """Clean up all resources before exit."""
     global active_monitor_stream, ffmpeg_process
 
@@ -541,7 +651,7 @@ def live_monitor_callback(indata, frames, time_info, status) -> None:
         else:
             raw_l = raw_r = float(np.sqrt(np.mean(indata[:, 0]**2)))
 
-        alpha = 0.4 if cfg['UI'].getboolean('smooth_meter_animation') else 1.0
+        alpha = 0.4 if _smooth_meter else 1.0
         smoothed_rms_l = (alpha * raw_l) + ((1 - alpha) * smoothed_rms_l)
         smoothed_rms_r = (alpha * raw_r) + ((1 - alpha) * smoothed_rms_r)
 
@@ -795,7 +905,8 @@ def watchdog_worker() -> None:
                     if sz == last_sz and sz > 0:
                         stalled_count += 1
                         if stalled_count >= 3:
-                            logging.warning("Recording file stalled")
+                            logging.error("Recording file stalled for 6+ seconds, triggering recovery")
+                            set_state(STATE_ERROR, "Recording stalled")
                             stalled_count = 0
                     else:
                         stalled_count = 0
@@ -807,10 +918,51 @@ def watchdog_worker() -> None:
             logging.error(f"Watchdog error: {e}")
 
 
-def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: str, output_format: str = 'flac') -> bool:
-    """Tags and moves the recorded file with integrity checking."""
+def get_final_path(out_dir: Path, track_info: Dict, naming_format: str, output_format: str = 'flac') -> Tuple[Path, Path]:
+    """Generates the target directory and final path for a track based on config rules.
+    Returns (target_dir, final_path).
+    """
+    artist = clean_filename(track_info['artists'][0]['name'])
+    album = clean_filename(track_info['album']['name'])
+    title = clean_filename(track_info['name'])
+    track_no = str(track_info.get('track_number', 0)).zfill(2)
+    year = track_info['album'].get('release_date', '0000')[:4]
+
+    tags = {
+        'artist': artist,
+        'album': album,
+        'title': title,
+        'track_no': track_no,
+        'year': year
+    }
+
+    organize_by = cfg['Naming'].get('organize_by', 'none').lower()
+    if organize_by == 'artist/album':
+        target_dir = out_dir / artist / album
+    elif organize_by == 'artist':
+        target_dir = out_dir / artist
+    else:
+        target_dir = out_dir
+
+    try:
+        final_name = naming_format.format(**tags)
+    except KeyError as e:
+        logging.warning(f"Missing tag in naming format: {e}, using fallback")
+        final_name = f"{track_no}. {artist} - {title}"
+
+    final_name = clean_filename(final_name)
+    final_path = target_dir / f"{final_name}.{output_format}"
+    
+    return target_dir, final_path
+
+
+def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: str, output_format: str = 'flac') -> Dict:
+    """Tags and moves the recorded file with integrity checking.
+    Returns a dict with 'ok': bool, 'size_mb': float, 'path': str on success,
+    or {'ok': False} on failure.
+    """
     if not temp_file or not temp_file.exists():
-        return False
+        return {'ok': False}
 
     try:
         # Verify file integrity
@@ -818,46 +970,27 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
             if temp_file.stat().st_size < 8192:
                 logging.warning(f"File too small, possible corruption: {temp_file}")
                 temp_file.unlink()
-                return False
+                return {'ok': False}
 
         # Wait a moment for file to be fully written
         time.sleep(1.5)
 
-        # Clean filenames
-        artist = clean_filename(track_info['artists'][0]['name'])
-        album = clean_filename(track_info['album']['name'])
-        title = clean_filename(track_info['name'])
-        track_no = str(track_info.get('track_number', 0)).zfill(2)
-        year = track_info['album'].get('release_date', '0000')[:4]
-
-        tags = {
-            'artist': artist,
-            'album': album,
-            'title': title,
-            'track_no': track_no,
-            'year': year
-        }
-
-        # Create final path
-        try:
-            final_name = naming_format.format(**tags)
-        except KeyError as e:
-            logging.warning(f"Missing tag in naming format: {e}, using fallback")
-            final_name = f"{track_no}. {artist} - {title}"
-
-        final_name = clean_filename(final_name)
-        final_path = out_dir / f"{final_name}.{output_format}"
+        target_dir, final_path = get_final_path(out_dir, track_info, naming_format, output_format)
+        target_dir.mkdir(parents=True, exist_ok=True)
 
         # Handle existing files
         if final_path.exists():
             if not cfg['Recording'].getboolean('overwrite_existing'):
                 timestamp = int(time.time())
-                final_path = out_dir / f"{final_name}_{timestamp}.{output_format}"
+                final_path = target_dir / f"{final_name}_{timestamp}.{output_format}"
                 logging.info(f"File exists, created: {final_path.name}")
             else:
                 logging.info(f"Overwriting existing file: {final_path.name}")
 
         if output_format == 'mp3':
+            year = track_info['album'].get('release_date', '0000')[:4]
+            track_no = str(track_info.get('track_number', 0)).zfill(2)
+
             audio = MP3(temp_file, ID3=ID3)
             if audio.tags is None:
                 audio.add_tags()
@@ -881,7 +1014,7 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
                 images = track_info['album'].get('images', [])
                 if images:
                     img_url = images[0]['url']
-                    response = requests.get(img_url, timeout=5, stream=True)
+                    response = requests.get(img_url, timeout=3, stream=True)
                     if response.status_code == 200:
                         content_type = response.headers.get('Content-Type', '')
                         # Reject immediately if Content-Length header exceeds our cap
@@ -890,13 +1023,16 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
                             logging.warning(f"Album art Content-Length exceeds {MAX_COVER_ART_BYTES} byte limit, skipping")
                         elif content_type.startswith('image/'):
                             # Read with size cap to prevent memory exhaustion
-                            img_data = b''
+                            chunks = []
+                            total_size = 0
                             for chunk in response.iter_content(chunk_size=65536):
-                                img_data += chunk
-                                if len(img_data) > MAX_COVER_ART_BYTES:
+                                chunks.append(chunk)
+                                total_size += len(chunk)
+                                if total_size > MAX_COVER_ART_BYTES:
                                     logging.warning(f"Album art exceeds {MAX_COVER_ART_BYTES} byte limit, skipping")
-                                    img_data = b''
+                                    chunks = []
                                     break
+                            img_data = b''.join(chunks)
                             if img_data:
                                 mime = content_type.split(';')[0].strip()
                                 if output_format == 'mp3':
@@ -927,8 +1063,9 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
 
         # Move to final location
         temp_file.replace(final_path)
+        size_mb = round(final_path.stat().st_size / (1024 ** 2), 2)
         logging.info(f"Finalised: {final_path.name}")
-        return True
+        return {'ok': True, 'size_mb': size_mb, 'path': str(final_path.name)}
 
     except Exception as e:
         logging.exception(f"Finalise Error: {e}")
@@ -937,34 +1074,29 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
                 temp_file.unlink()
         except Exception:
             pass
-        return False
+        return {'ok': False}
 
 
 def safely_stop_ffmpeg(proc) -> None:
-    """Shutdown protocol for FFmpeg to prevent pipe corruption."""
+    """Shutdown protocol for FFmpeg. Uses SIGTERM which FFmpeg handles gracefully."""
     if not proc or proc.poll() is not None:
         return
 
     set_state(STATE_STOPPING)
 
     try:
-        if proc.stdin:
-            proc.stdin.write(b'q')
-            proc.stdin.flush()
-            proc.stdin.close()
+        # SIGTERM on Unix / TerminateProcess on Windows — FFmpeg handles
+        # SIGTERM gracefully by flushing buffers and finalising the output file.
+        proc.terminate()
 
         try:
             proc.wait(timeout=10)
             logging.info("FFmpeg stopped gracefully")
         except subprocess.TimeoutExpired:
-            logging.warning("FFmpeg didn't respond, terminating...")
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                logging.warning("FFmpeg killed")
+            logging.warning("FFmpeg didn't respond to SIGTERM, killing...")
+            proc.kill()
+            proc.wait()
+            logging.warning("FFmpeg killed")
 
     except Exception as e:
         logging.error(f"Error stopping FFmpeg: {e}")
@@ -1046,6 +1178,11 @@ def main():
     parser.add_argument('--ffmpeg', default='ffmpeg', help='Path to ffmpeg executable')
     args = parser.parse_args()
 
+    # Load blocklist
+    blocklist = load_blocklist()
+    if blocklist:
+        console.print(f"[green]Loaded {len(blocklist)} blocklist rules.[/green]")
+
     # Setup directories
     out_dir = resolve_path(cfg['Recording'].get('output_directory', 'Recordings'))
     naming_format = cfg['Naming'].get('naming_format', '{track_no}. {artist} - {title}')
@@ -1068,23 +1205,34 @@ def main():
     # Hardware initialisation
     hw_ready = cfg.get('Recording', 'ffmpeg_name', fallback='') != ''
 
+    # Validate that saved device_id still exists before trusting config
+    if hw_ready:
+        try:
+            saved_idx = int(cfg['Recording'].get('device_id'))
+            devices = sd.query_devices()
+            if saved_idx >= len(devices) or devices[saved_idx]['max_input_channels'] == 0:
+                console.print("[yellow]Previously saved audio device not found. Re-scanning...[/yellow]")
+                hw_ready = False
+        except Exception:
+            console.print("[yellow]Could not validate saved device. Re-scanning...[/yellow]")
+            hw_ready = False
+
     if hw_ready:
         console.print("[yellow]Found existing config. Press SPACE in 5s to re-scan hardware...[/yellow]")
         start_time = time.time()
         rescan = False
-
-        while time.time() - start_time < 5:
-            if os.name == 'nt' and msvcrt.kbhit():
-                if msvcrt.getch() == b' ':
-                    rescan = True
-                    break
-            elif os.name != 'nt':
-                if select.select([sys.stdin], [], [], 0.1)[0]:
-                    c = sys.stdin.read(1)
-                    if c == ' ':
+        
+        kb = KBHit()
+        kb.set_cbreak()
+        try:
+            while time.time() - start_time < 5:
+                if kb.kbhit():
+                    if kb.getch() == ' ':
                         rescan = True
                         break
-            time.sleep(0.1)
+                time.sleep(0.1)
+        finally:
+            kb.set_normal_term()
 
         if rescan:
             hw_name, hw_idx, hw_sr, hw_ch = discover_hardware(args.ffmpeg)
@@ -1122,12 +1270,9 @@ def main():
         time.sleep(5)
         sys.exit(1)
 
-    # Start background workers
-    workers = []
-    for target in [watchdog_worker]:
-        t = threading.Thread(target=target, daemon=True)
-        t.start()
-        workers.append(t)
+    # Start background watchdog worker
+    watchdog_thread = threading.Thread(target=watchdog_worker, daemon=True)
+    watchdog_thread.start()
 
     # Setup FFmpeg logging
     ff_log_ptr = subprocess.DEVNULL
@@ -1147,9 +1292,26 @@ def main():
     temp_file = None
     last_error_time = 0
     error_recovery_delay = 2
+    last_file_size_check = 0
+    cached_file_size = 0.0
+
+    # Session tracking
+    session_start_time = time.time()
+    session_tracks_ok = 0
+    session_total_bytes = 0
+    track_history = deque(maxlen=8)  # Last N tracks with status
+
+    # Initialize recording params from config to prevent NameError on first iteration
+    sr = int(cfg['Recording'].get('sample_rate', '48000'))
+    ch = int(cfg['Recording'].get('channels', '2'))
+    bit_depth = cfg['Recording'].get('bit_depth', '24')
 
     # Determine platform-specific FFmpeg input format
     ffmpeg_input_fmt = get_ffmpeg_input_format()
+
+    # Initialize keyboard listener for the main loop
+    kb = KBHit()
+    kb.set_cbreak()
 
     set_state(STATE_MONITORING)
 
@@ -1176,8 +1338,44 @@ def main():
                                     ffmpeg_process = None
 
                                 if temp_file and current_track:
-                                    finalize(temp_file, out_dir, current_track, naming_format, output_format)
+                                    result = finalize(temp_file, out_dir, current_track, naming_format, output_format)
+                                    if result['ok']:
+                                        track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': result['size_mb'], 'status': 'ok'})
+                                        session_tracks_ok += 1
+                                        session_total_bytes += int(result['size_mb'] * 1024 * 1024)
+                                    else:
+                                        track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': 0, 'status': 'fail'})
+                                        failed_recordings.append(current_track['name'])
                                     temp_file = None
+
+                            # Check for duplicates before starting recording
+                            _, predicted_path = get_final_path(out_dir, track, naming_format, output_format)
+                            
+                            # 1. Check blocklist
+                            is_blocked, block_reason = is_track_blocked(track, blocklist)
+                            if is_blocked:
+                                console.print(f"[yellow]Skipping Blocked Track: {track['name']} ({block_reason})[/yellow]")
+                                logging.info(f"Skipped track {track['name']}: {block_reason}")
+                                track_history.append({'name': track['name'], 'artist': track['artists'][0]['name'], 'size': 0, 'status': 'skip'})
+                                set_state(STATE_SKIPPED)
+                                current_track = track
+                                current_id = track_id
+                                current_track_id_ref = track_id
+                                temp_file = None
+                                continue
+
+                            # 2. Check duplicate
+                            if predicted_path.exists() and not cfg['Recording'].getboolean('overwrite_existing'):
+                                console.print(f"[yellow]Skipping Duplicate: {track['name']} - {track['artists'][0]['name']}[/yellow]")
+                                logging.info(f"Skipping duplicate: {predicted_path.name}")
+                                
+                                track_history.append({'name': track['name'], 'artist': track['artists'][0]['name'], 'size': 0, 'status': 'skip'})
+                                set_state(STATE_SKIPPED)
+                                current_track = track
+                                current_id = track_id
+                                current_track_id_ref = track_id
+                                temp_file = None
+                                continue
 
                             # Start new recording
                             safe_mode = cfg['Recording'].getboolean('force_safe_mode')
@@ -1201,7 +1399,7 @@ def main():
                             # Build cross-platform FFmpeg command
                             device_arg = get_ffmpeg_device_arg(hw_name)
                             cmd = [
-                                args.ffmpeg, '-y', '-nostdin',
+                                args.ffmpeg, '-y',
                                 '-f', ffmpeg_input_fmt,
                                 '-thread_queue_size', '512',
                                 '-i', device_arg,
@@ -1228,7 +1426,7 @@ def main():
                                 with ffmpeg_lock:
                                     ffmpeg_process = subprocess.Popen(
                                         cmd,
-                                        stdin=subprocess.PIPE,
+                                        stdin=subprocess.DEVNULL,
                                         stdout=subprocess.DEVNULL,
                                         stderr=ff_log_ptr
                                     )
@@ -1253,18 +1451,28 @@ def main():
                                 set_state(STATE_ERROR, f"FFmpeg error: {e}")
                                 continue
 
-                        # Build UI display
-                        if temp_file and temp_file.exists():
-                            file_size = round(temp_file.stat().st_size / (1024 ** 2), 2)
-                        else:
-                            file_size = 0.0
+                        # Build UI display (cache file_size to ~1Hz instead of 10Hz)
+                        now = time.time()
+                        if now - last_file_size_check > 1.0:
+                            if temp_file and temp_file.exists():
+                                cached_file_size = round(temp_file.stat().st_size / (1024 ** 2), 2)
+                            else:
+                                cached_file_size = 0.0
+                            last_file_size_check = now
+                        file_size = cached_file_size
 
                         progress = playback.get('progress_ms', 0)
                         duration = track.get('duration_ms', 1)
 
                         dashboard = Table.grid(expand=True)
 
-                        rec_indicator = "[bold red]REC \u25cf[/bold red]" if get_state() == STATE_RECORDING else "[yellow]WAIT[/yellow]"
+                        if get_state() == STATE_RECORDING:
+                            rec_indicator = "[bold red]REC \u25cf[/bold red]"
+                        elif get_state() == STATE_SKIPPED:
+                            rec_indicator = "[bold yellow]SKIP \u23ed[/bold yellow]"
+                        else:
+                            rec_indicator = "[yellow]WAIT[/yellow]"
+
                         dashboard.add_row(Text.from_markup(f"{rec_indicator}  [bold cyan]{track['name']}[/bold cyan]"))
                         dashboard.add_row(Text(f"Artist: {track['artists'][0]['name']}", style="grey70"))
                         dashboard.add_row(Text(f"Album: {track['album']['name']}", style="grey70"))
@@ -1316,6 +1524,31 @@ def main():
 
                         dashboard.add_section()
 
+                        # Session statistics strip
+                        elapsed = time.time() - session_start_time
+                        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+                        total_mb = round(session_total_bytes / (1024 ** 2), 1)
+                        try:
+                            disk_free = round(shutil.disk_usage(out_dir).free / (1024 ** 3), 1)
+                            disk_str = f" | Disk Free: {disk_free} GB"
+                        except Exception:
+                            disk_str = ""
+                        stats_line = f"\U0001f4ca Session: {session_tracks_ok} tracks | {total_mb} MB | {elapsed_str}{disk_str}"
+                        dashboard.add_row(Text.from_markup(f"[dim]{stats_line}[/dim]"))
+
+                        # Track history panel
+                        if track_history:
+                            history_table = Table.grid(expand=True)
+                            for entry in track_history:
+                                icon = "[green]\u2705[/green]" if entry['status'] == 'ok' else ("[yellow]\u23ed[/yellow]" if entry['status'] == 'skip' else "[red]\u274c[/red]")
+                                size_str = f"{entry['size']}MB" if entry['status'] == 'ok' else ("DUP" if entry['status'] == 'skip' else "FAIL")
+                                history_table.add_row(Text.from_markup(f"{icon} [dim]{entry['artist']}[/dim] - {entry['name']} [dim]{size_str}[/dim]"))
+                            dashboard.add_row(Panel(history_table, title="Recent Recordings", border_style="dim"))
+
+                        # Keyboard Shortcut Bar
+                        shortcuts = "[bold][Q][/bold] Quit | [bold][D][/bold] Toggle Debug | [bold][F][/bold] Toggle Safe Mode"
+                        dashboard.add_row(Text.from_markup(f"\n[dim]{shortcuts}[/dim]"))
+
                         if cfg['Diagnostics'].getboolean('enable_logging'):
                             logs = get_tail_logs(3)
                             if logs:
@@ -1334,13 +1567,20 @@ def main():
                                 ffmpeg_process = None
 
                             if temp_file and current_track:
-                                if finalize(temp_file, out_dir, current_track, naming_format, output_format):
+                                result = finalize(temp_file, out_dir, current_track, naming_format, output_format)
+                                if result['ok']:
+                                    track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': result['size_mb'], 'status': 'ok'})
+                                    session_tracks_ok += 1
+                                    session_total_bytes += int(result['size_mb'] * 1024 * 1024)
                                     logging.info(f"Saved: {current_track['name']}")
                                     console.print(f"[green]\u2713 Saved: {current_track['name']}[/green]")
+                                    
+                                    # Webhook Notification
+                                    if cfg['Webhooks'].getboolean('notify_on_track_saved'):
+                                        send_webhook(f"✅ **Saved:** `{current_track['artists'][0]['name']} - {current_track['name']}` ({result['size_mb']} MB)")
                                 else:
+                                    track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': 0, 'status': 'fail'})
                                     failed_recordings.append(current_track['name'])
-                                    if len(failed_recordings) > 5:
-                                        failed_recordings.pop(0)
                                     console.print(f"[red]\u2717 Failed to save: {current_track['name']}[/red]")
 
                             temp_file = None
@@ -1357,6 +1597,33 @@ def main():
                             idle_dashboard.add_section()
                             idle_dashboard.add_row(Text(f"\u26a0\ufe0f Failed recordings: {len(failed_recordings)}", style="bold red"))
 
+                        idle_dashboard.add_section()
+
+                        # Session statistics strip (Idle)
+                        elapsed = time.time() - session_start_time
+                        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+                        total_mb = round(session_total_bytes / (1024 ** 2), 1)
+                        try:
+                            disk_free = round(shutil.disk_usage(out_dir).free / (1024 ** 3), 1)
+                            disk_str = f" | Disk Free: {disk_free} GB"
+                        except Exception:
+                            disk_str = ""
+                        stats_line = f"\U0001f4ca Session: {session_tracks_ok} tracks | {total_mb} MB | {elapsed_str}{disk_str}"
+                        idle_dashboard.add_row(Text.from_markup(f"[dim]{stats_line}[/dim]"))
+
+                        # Track history panel (Idle)
+                        if track_history:
+                            history_table = Table.grid(expand=True)
+                            for entry in track_history:
+                                icon = "[green]\u2705[/green]" if entry['status'] == 'ok' else ("[yellow]\u23ed[/yellow]" if entry['status'] == 'skip' else "[red]\u274c[/red]")
+                                size_str = f"{entry['size']}MB" if entry['status'] == 'ok' else ("DUP" if entry['status'] == 'skip' else "FAIL")
+                                history_table.add_row(Text.from_markup(f"{icon} [dim]{entry['artist']}[/dim] - {entry['name']} [dim]{size_str}[/dim]"))
+                            idle_dashboard.add_row(Panel(history_table, title="Recent Recordings", border_style="dim"))
+
+                        # Keyboard Shortcut Bar
+                        shortcuts = "[bold][Q][/bold] Quit | [bold][D][/bold] Toggle Debug | [bold][F][/bold] Toggle Safe Mode"
+                        idle_dashboard.add_row(Text.from_markup(f"\n[dim]{shortcuts}[/dim]"))
+
                         if cfg['Diagnostics'].getboolean('enable_logging'):
                             idle_dashboard.add_section()
                             logs = get_tail_logs(3)
@@ -1365,31 +1632,38 @@ def main():
 
                         live.update(Panel(idle_dashboard, title=f"SpytoRec v{SCRIPT_VERSION}", border_style="blue"))
 
-                    time.sleep(0.1)
+                    # Adaptive polling: less frequent when idle, moderate when recording
+                    if playback and playback.get('is_playing'):
+                        time.sleep(0.5)  # 2Hz during playback
+                    else:
+                        time.sleep(2.0)  # 0.5Hz when idle
+
+                    # Keyboard Polling
+                    if kb.kbhit():
+                        key = kb.getch()
+                        if key == 'q':
+                            logging.info("User initiated graceful quit")
+                            stop_event.set()
+                        elif key == 'd':
+                            cfg['Debug']['show_debug_overlay'] = str(not cfg['Debug'].getboolean('show_debug_overlay'))
+                        elif key == 'f':
+                            cfg['Recording']['force_safe_mode'] = str(not cfg['Recording'].getboolean('force_safe_mode'))
+                            console.print("[yellow]Safe Mode toggled (will apply next track)[/yellow]")
 
                 except SpotifyException as e:
                     logging.error(f"Spotify API error: {e}")
-                    if time.time() - last_error_time > error_recovery_delay:
-                        set_state(STATE_ERROR, f"Spotify error: {e}")
-                        last_error_time = time.time()
+                    # Distinguish auth-dead from transient errors
+                    if hasattr(e, 'http_status') and e.http_status == 401:
+                        console.print("[red]Spotify authentication expired. Please restart to re-authenticate.[/red]")
+                        logging.error("Spotify auth token expired (401). Manual restart required.")
                         time.sleep(5)
-                        set_state(STATE_RECOVERING)
-                        time.sleep(2)
-                        set_state(STATE_MONITORING)
+                        stop_event.set()
                     else:
-                        time.sleep(1)
+                        last_error_time = handle_error_recovery(e, last_error_time, error_recovery_delay)
 
                 except Exception as e:
                     logging.exception(f"Main loop error: {e}")
-                    if time.time() - last_error_time > error_recovery_delay:
-                        set_state(STATE_ERROR, str(e))
-                        last_error_time = time.time()
-                        time.sleep(5)
-                        set_state(STATE_RECOVERING)
-                        time.sleep(2)
-                        set_state(STATE_MONITORING)
-                    else:
-                        time.sleep(1)
+                    last_error_time = handle_error_recovery(e, last_error_time, error_recovery_delay)
 
     finally:
         if ff_log_ptr != subprocess.DEVNULL:
@@ -1398,13 +1672,41 @@ def main():
             except Exception:
                 pass
 
-        for worker in workers:
-            worker.join(timeout=2)
+        kb.set_normal_term()
+        watchdog_thread.join(timeout=2)
+
+        # Post-Session Summary
+        elapsed = time.time() - session_start_time
+        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+        total_mb = round(session_total_bytes / (1024 ** 2), 1)
+
+        summary = Table(title="[bold cyan]SpytoRec Session Summary[/bold cyan]", show_header=False, expand=True)
+        summary.add_column("Stat", style="yellow")
+        summary.add_column("Value", style="green")
+
+        summary.add_row("Duration:", elapsed_str)
+        summary.add_row("Tracks:", f"{session_tracks_ok} recorded, {len(failed_recordings)} failed")
+        summary.add_row("Total Size:", f"{total_mb} MB")
+        summary.add_row("Format:", f"{output_format.upper()} {bit_depth}-bit / {sr}Hz")
+        summary.add_row("Output:", str(out_dir))
+
+        console.print("\n")
+        console.print(Panel(summary, border_style="cyan"))
 
         if failed_recordings:
             console.print(f"\n[yellow]Recording session completed with {len(failed_recordings)} failed tracks[/yellow]")
         else:
             console.print("\n[green]Recording session completed successfully![/green]")
+
+        if cfg['Webhooks'].getboolean('notify_on_session_end'):
+            fail_str = f" ({len(failed_recordings)} failed)" if failed_recordings else ""
+            msg = (
+                f"🏁 **Session Completed**\n"
+                f"- **Duration:** {elapsed_str}\n"
+                f"- **Tracks:** {session_tracks_ok} recorded{fail_str}\n"
+                f"- **Total Size:** {total_mb} MB"
+            )
+            send_webhook(msg)
 
 
 if __name__ == "__main__":
