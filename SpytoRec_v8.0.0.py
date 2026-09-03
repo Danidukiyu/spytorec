@@ -56,6 +56,7 @@ import argparse
 import subprocess
 import re
 import queue
+import io
 from collections import deque
 import threading
 import configparser
@@ -88,8 +89,9 @@ try:
     from rich.table import Table
     from rich.progress_bar import ProgressBar
     from rich.spinner import Spinner
+    from PIL import Image
 except ImportError as e:
-    print(f"CRITICAL: Missing library: {e}\nPlease install required packages: pip install sounddevice numpy mutagen spotipy rich requests")
+    print(f"CRITICAL: Missing library: {e}\nPlease install required packages: pip install sounddevice numpy mutagen spotipy rich requests Pillow")
     sys.exit(1)
 
 # Platform-specific imports
@@ -168,14 +170,15 @@ STATE_IDLE = 'Idle'
 STATE_SKIPPED = 'Skipped'
 
 VALID_STATE_TRANSITIONS = {
-    STATE_INIT: {STATE_IDLE, STATE_ERROR},
+    STATE_INIT: {STATE_IDLE, STATE_ERROR, STATE_MONITORING},
     STATE_IDLE: {STATE_MONITORING, STATE_ERROR},
-    STATE_MONITORING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR},
+    STATE_MONITORING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR, STATE_SKIPPED, STATE_SWITCHING},
     STATE_RECORDING: {STATE_SWITCHING, STATE_STOPPING, STATE_ERROR, STATE_RECOVERING},
     STATE_SWITCHING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR},
     STATE_STOPPING: {STATE_IDLE, STATE_ERROR},
-    STATE_ERROR: {STATE_RECOVERING, STATE_IDLE},
-    STATE_RECOVERING: {STATE_IDLE, STATE_MONITORING, STATE_ERROR}
+    STATE_ERROR: {STATE_RECOVERING, STATE_IDLE, STATE_ERROR},
+    STATE_RECOVERING: {STATE_IDLE, STATE_MONITORING, STATE_ERROR},
+    STATE_SKIPPED: {STATE_MONITORING, STATE_RECORDING, STATE_IDLE, STATE_ERROR, STATE_SWITCHING, STATE_SKIPPED}
 }
 
 # --- Thread-Safe Shared State ---
@@ -521,6 +524,7 @@ def get_tail_logs(n: int = 4) -> str:
         return "Waiting for logs..."
 
 
+
 def load_blocklist() -> List[str]:
     """Loads the blocklist.txt file into a list of rules."""
     blocklist = []
@@ -564,12 +568,13 @@ def send_webhook(message: str) -> None:
     except Exception as e:
         logging.error(f"Failed to send webhook: {e}")
 
-
-def get_health_indicator(peak_level: float) -> str:
+def cleanup_resources():
     """Clean up all resources before exit."""
     global active_monitor_stream, ffmpeg_process
 
     logging.info("Cleaning up resources...")
+
+    stop_event.set()
 
     stop_monitor_stream()
 
@@ -580,8 +585,6 @@ def get_health_indicator(peak_level: float) -> str:
             except Exception:
                 pass
         ffmpeg_process = None
-
-    stop_event.set()
 
     for handler in logging.getLogger().handlers:
         try:
@@ -663,8 +666,53 @@ def live_monitor_callback(indata, frames, time_info, status) -> None:
         else:
             mono_warning_frames = max(0, mono_warning_frames - 2)
 
+        # Pipe audio data to the writer queue
+        cur = get_state()
+        if cur == STATE_RECORDING:
+            # During recording: drop frames only if queue is completely full
+            try:
+                audio_queue.put_nowait(indata.tobytes())
+            except queue.Full:
+                pass
+        elif cur == STATE_MONITORING and raw_l > 0.001:
+            # Pre-roll buffer: keep a rolling window so we capture the first beat
+            if audio_queue.full():
+                try:
+                    audio_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                audio_queue.put_nowait(indata.tobytes())
+            except queue.Full:
+                pass
+
     except Exception as e:
         logging.debug(f"Monitor callback error: {e}")
+
+# Continuous Audio Pipe Queue
+audio_queue = queue.Queue(maxsize=200)
+
+def audio_writer_worker():
+    """Background thread that writes continuous audio data to FFmpeg stdin."""
+    global ffmpeg_process
+    pipe_broken_logged = False
+    while True:
+        try:
+            chunk = audio_queue.get()
+            if get_state() == STATE_RECORDING and ffmpeg_process and ffmpeg_process.stdin:
+                try:
+                    ffmpeg_process.stdin.write(chunk)
+                    pipe_broken_logged = False  # Reset on successful write
+                except (BrokenPipeError, OSError):
+                    if not pipe_broken_logged:
+                        logging.debug("FFmpeg stdin pipe closed, waiting for new process")
+                        pipe_broken_logged = True
+                except Exception as e:
+                    if not pipe_broken_logged:
+                        logging.debug(f"Audio writer error: {e}")
+                        pipe_broken_logged = True
+        except Exception:
+            pass
 
 
 def start_monitor(idx: int, sr: int, ch: int) -> bool:
@@ -682,6 +730,7 @@ def start_monitor(idx: int, sr: int, ch: int) -> bool:
             device=idx,
             channels=min(2, ch),
             samplerate=sr,
+            dtype='float32',
             callback=live_monitor_callback,
             blocksize=1024,
             latency='low'
@@ -694,16 +743,7 @@ def start_monitor(idx: int, sr: int, ch: int) -> bool:
         return False
 
 
-def get_keypress_unix():
-    """Get a single keypress on Unix systems without blocking."""
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(sys.stdin.fileno())
-        ch = sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
+
 
 
 def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
@@ -763,10 +803,10 @@ def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
     buf = ""
 
     def build_hw_table():
-        t = Table(title="[bold cyan]Hardware Selection[/bold cyan]")
-        t.add_column("ID", justify="center")
+        t = Table(title=f"[{SP_GREEN}]Hardware Selection[/{SP_GREEN}]")
+        t.add_column("ID", justify="center", style=SP_GREEN_DIM)
         t.add_column("Device Name")
-        t.add_column("Details", style="magenta")
+        t.add_column("Details", style=SP_GREY)
         t.add_column("Level")
 
         rows = {}
@@ -780,19 +820,20 @@ def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
                 level = min(40, int(meter_data.get(i, 0) * 40))
                 
                 # Dim the row if no audio is detected
-                style = "dim" if meter_peaks.get(i, 0) <= AUDIO_THRESHOLD else "default"
+                has_audio = meter_peaks.get(i, 0) > AUDIO_THRESHOLD
+                style = SP_GREEN_DIM if has_audio else "dim"
                 
                 t.add_row(
                     f"[{count}]",
                     f"[{style}]{devices[i]['name']}[/{style}]",
                     f"[{style}]{sr}Hz | {ch}ch[/{style}]",
-                    f"[{style}]" + "\u2588" * level + f"[/{style}]"
+                    f"[{SP_GREEN_DIM}]" + "\u2588" * level + f"[/{SP_GREEN_DIM}]" if has_audio else f"[dim]" + "\u2501" * 5 + "[/dim]"
                 )
                 rows[count] = dict(devices[i])
                 rows[count]['idx'] = i
                 count += 1
 
-        return Panel(t, subtitle=f"Selection: {buf}"), rows
+        return Panel(t, subtitle=f"[{SP_GREY}]Selection: {buf}[/{SP_GREY}]", border_style=SP_GREEN_DIM), rows
 
     console.print("[yellow]Press number keys to select device, Enter to confirm[/yellow]")
 
@@ -815,7 +856,7 @@ def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
                             buf += c.decode()
                 else:
                     if select.select([sys.stdin], [], [], 0.05)[0]:
-                        c = get_keypress_unix()
+                        c = sys.stdin.read(1)
                         if c in ['\r', '\n']:
                             if buf.isdigit() and int(buf) in rows:
                                 selected = rows[int(buf)]
@@ -852,7 +893,7 @@ def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
     cfg.set('Recording', 'ffmpeg_name', best_name)
     cfg.set('Recording', 'device_id', str(selected['idx']))
     cfg.set('Recording', 'sample_rate', str(int(selected['default_samplerate'])))
-    cfg.set('Recording', 'channels', str(selected['max_input_channels']))
+    cfg.set('Recording', 'channels', str(min(2, selected['max_input_channels'])))
 
     try:
         with file_lock(LOCK_FILE_PATH):
@@ -861,7 +902,7 @@ def discover_hardware(ffmpeg_path: str) -> Tuple[str, int, int, int]:
     except Exception as e:
         console.print(f"[yellow]Could not save config: {e}[/yellow]")
 
-    return best_name, selected['idx'], int(selected['default_samplerate']), selected['max_input_channels']
+    return best_name, selected['idx'], int(selected['default_samplerate']), min(2, selected['max_input_channels'])
 
 
 # --- 4. RECORDING & SUBPROCESS ---
@@ -982,15 +1023,15 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
         if final_path.exists():
             if not cfg['Recording'].getboolean('overwrite_existing'):
                 timestamp = int(time.time())
-                final_path = target_dir / f"{final_name}_{timestamp}.{output_format}"
+                final_path = target_dir / f"{final_path.stem}_{timestamp}.{output_format}"
                 logging.info(f"File exists, created: {final_path.name}")
             else:
                 logging.info(f"Overwriting existing file: {final_path.name}")
 
-        if output_format == 'mp3':
-            year = track_info['album'].get('release_date', '0000')[:4]
-            track_no = str(track_info.get('track_number', 0)).zfill(2)
+        year = track_info['album'].get('release_date', '0000')[:4]
+        track_no = str(track_info.get('track_number', 0)).zfill(2)
 
+        if output_format == 'mp3':
             audio = MP3(temp_file, ID3=ID3)
             if audio.tags is None:
                 audio.add_tags()
@@ -1078,20 +1119,38 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict, naming_format: st
 
 
 def safely_stop_ffmpeg(proc) -> None:
-    """Shutdown protocol for FFmpeg. Uses SIGTERM which FFmpeg handles gracefully."""
+    """Shutdown protocol for FFmpeg with proper stdin pipe closure.
+    Closes stdin first to signal EOF, letting FFmpeg flush its output buffer
+    and finalize the file header. Then terminates if it doesn't exit on its own.
+    Note: Callers are responsible for managing state transitions (e.g. STATE_STOPPING).
+    """
     if not proc or proc.poll() is not None:
         return
 
-    set_state(STATE_STOPPING)
-
     try:
-        # SIGTERM on Unix / TerminateProcess on Windows — FFmpeg handles
-        # SIGTERM gracefully by flushing buffers and finalising the output file.
+        # Step 1: Close stdin pipe to signal EOF to FFmpeg.
+        # This lets FFmpeg flush its internal buffers and write proper file headers.
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+        # Step 2: Wait for FFmpeg to exit gracefully after receiving EOF.
+        try:
+            proc.wait(timeout=5)
+            logging.info("FFmpeg stopped gracefully via stdin EOF")
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Step 3: FFmpeg didn't exit after EOF, send SIGTERM.
+        logging.warning("FFmpeg didn't exit after stdin close, sending SIGTERM...")
         proc.terminate()
 
         try:
-            proc.wait(timeout=10)
-            logging.info("FFmpeg stopped gracefully")
+            proc.wait(timeout=5)
+            logging.info("FFmpeg stopped after SIGTERM")
         except subprocess.TimeoutExpired:
             logging.warning("FFmpeg didn't respond to SIGTERM, killing...")
             proc.kill()
@@ -1131,19 +1190,37 @@ def spotify_with_retry(sp, max_retries=3):
 
 # --- 5. UI HELPER FUNCTIONS ---
 
+# --- Spotify-Branded Color Theme ---
+# Primary green: #1DB954 — Rich markup closest: "green" with bold
+# We define semantic color names so the whole UI stays consistent.
+SP_GREEN = "bold #1DB954"       # Spotify primary green — used for accents, active state
+SP_GREEN_DIM = "#1DB954"        # Non-bold green for subtler elements
+SP_WHITE = "bold white"         # Track titles, headers
+SP_GREY = "grey70"              # Secondary text (artist, album)
+SP_DARK = "grey30"              # Muted/background text
+SP_BAR_BORDER = "#1DB954"       # Panel border color when recording
+SP_IDLE_BORDER = "#535353"      # Panel border color when idle
+SP_REC_RED = "bold red"         # Recording indicator
+SP_SKIP_YELLOW = "bold yellow"  # Skipped indicator
+
+# Album art cache: track_id -> list of Rich Text lines (capped to prevent unbounded growth)
+_album_art_cache: Dict[str, List[str]] = {}
+_ALBUM_ART_CACHE_MAX = 50
+
+
 def get_health_indicator(rms: float) -> str:
     """Returns health status based on RMS level."""
     if rms > 0.85:
         return "[bold red]\U0001f534 Clipping[/bold red]"
     if rms < 0.001:
         return "[yellow]\U0001f7e1 Low[/yellow]"
-    return "[green]\U0001f7e2 Good[/green]"
+    return f"[{SP_GREEN_DIM}]\U0001f7e2 Good[/{SP_GREEN_DIM}]"
 
 
 def build_gradient_bar(rms: float, peak: float, width: int = 40, show_peak: bool = True) -> str:
-    """Builds a gradient level meter bar."""
+    """Builds a gradient level meter bar with dB readout."""
     if np.isnan(rms) or rms <= 1e-6:
-        return "[dim]\u2501[/dim]" * width
+        return "[dim]\u2501[/dim]" * width + "  [dim]  -∞ dB[/dim]"
 
     db = 20 * np.log10(rms + 1e-9)
     db_peak = 20 * np.log10(peak + 1e-9)
@@ -1157,7 +1234,7 @@ def build_gradient_bar(rms: float, peak: float, width: int = 40, show_peak: bool
             bar_chars.append("[white]\u275a[/white]")
         elif i < fill:
             if i < width * 0.6:
-                bar_chars.append("[green]\u2588[/green]")
+                bar_chars.append(f"[{SP_GREEN_DIM}]\u2588[/{SP_GREEN_DIM}]")
             elif i < width * 0.85:
                 bar_chars.append("[yellow]\u2588[/yellow]")
             else:
@@ -1165,7 +1242,292 @@ def build_gradient_bar(rms: float, peak: float, width: int = 40, show_peak: bool
         else:
             bar_chars.append("[dim]\u2501[/dim]")
 
-    return "".join(bar_chars)
+    # Numeric dB readout
+    db_str = f"{db:+.1f} dB"
+    if db > -3:
+        db_color = "bold red"
+    elif db > -12:
+        db_color = "yellow"
+    else:
+        db_color = SP_GREEN_DIM
+
+    return "".join(bar_chars) + f"  [{db_color}]{db_str}[/{db_color}]"
+
+
+def format_time_ms(ms: int) -> str:
+    """Formats milliseconds as MM:SS."""
+    minutes = ms // 60000
+    seconds = (ms // 1000) % 60
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def fetch_album_art_ascii(track: Dict, width: int = 12, height: int = 6) -> List[str]:
+    """Downloads album art thumbnail and converts to half-block ASCII art.
+    Returns a list of Rich-markup strings (one per row). Cached per track ID.
+    Uses ▀▄█ half-block characters for 2x vertical resolution.
+    """
+    track_id = track.get('id', '')
+    if track_id in _album_art_cache:
+        return _album_art_cache[track_id]
+
+    # Evict oldest entries if cache is full
+    if len(_album_art_cache) >= _ALBUM_ART_CACHE_MAX:
+        try:
+            oldest_key = next(iter(_album_art_cache))
+            del _album_art_cache[oldest_key]
+        except StopIteration:
+            pass
+
+    # Default blank art
+    blank = [f"[dim]{'░' * width}[/dim]"] * height
+    try:
+        images = track.get('album', {}).get('images', [])
+        if not images:
+            _album_art_cache[track_id] = blank
+            return blank
+
+        # Use smallest image (usually 64x64)
+        img_url = images[-1]['url']
+        response = requests.get(img_url, timeout=2)
+        if response.status_code != 200:
+            _album_art_cache[track_id] = blank
+            return blank
+
+        img = Image.open(io.BytesIO(response.content)).convert('RGB')
+        # Resize: width chars, height*2 pixels (half-blocks give 2 rows per char row)
+        img = img.resize((width, height * 2), Image.LANCZOS)
+
+        lines = []
+        for y in range(0, height * 2, 2):
+            line_parts = []
+            for x in range(width):
+                # Top pixel -> foreground (▀), Bottom pixel -> background
+                r1, g1, b1 = img.getpixel((x, y))
+                r2, g2, b2 = img.getpixel((x, min(y + 1, height * 2 - 1)))
+                # Use Rich color markup with RGB
+                line_parts.append(
+                    f"[rgb({r1},{g1},{b1}) on rgb({r2},{g2},{b2})]▀[/rgb({r1},{g1},{b1}) on rgb({r2},{g2},{b2})]"
+                )
+            lines.append("".join(line_parts))
+
+        _album_art_cache[track_id] = lines
+        return lines
+
+    except Exception as e:
+        logging.debug(f"Album art ASCII conversion failed: {e}")
+        _album_art_cache[track_id] = blank
+        return blank
+
+
+def build_shortcut_bar() -> Text:
+    """Builds a color-coded keyboard shortcut bar."""
+    return Text.from_markup(
+        f"  [{SP_REC_RED}]Q[/{SP_REC_RED}][dim] Quit[/dim]"
+        f"   [cyan]D[/cyan][dim] Debug[/dim]"
+        f"   [yellow]F[/yellow][dim] Safe Mode[/dim]"
+        f"   [{SP_GREEN_DIM}]S[/{SP_GREEN_DIM}][dim] Skip Track[/dim]"
+    )
+
+
+def build_history_table(track_history, style: str = "dim") -> Optional[Panel]:
+    """Builds a structured track history table. Returns None if history is empty."""
+    if not track_history:
+        return None
+
+    history = Table(show_header=True, header_style=SP_DARK, expand=True, box=None, padding=(0, 1))
+    history.add_column("", width=2)
+    history.add_column("Artist", style=SP_GREY, max_width=20, no_wrap=True)
+    history.add_column("Track", max_width=30, no_wrap=True)
+    history.add_column("Size", justify="right", style=SP_GREY, width=8)
+    history.add_column("Status", justify="center", width=6)
+
+    for entry in track_history:
+        if entry['status'] == 'ok':
+            icon = f"[{SP_GREEN_DIM}]✅[/{SP_GREEN_DIM}]"
+            status = f"[{SP_GREEN_DIM}]OK[/{SP_GREEN_DIM}]"
+            size_str = f"{entry['size']}MB"
+        elif entry['status'] == 'skip':
+            icon = "[yellow]⏭[/yellow]"
+            status = "[yellow]SKIP[/yellow]"
+            size_str = "—"
+        else:
+            icon = "[red]❌[/red]"
+            status = "[red]FAIL[/red]"
+            size_str = "—"
+
+        history.add_row(icon, entry['artist'], entry['name'], size_str, status)
+
+    return Panel(history, title=f"[{SP_DARK}]Recent Recordings[/{SP_DARK}]", border_style=SP_DARK)
+
+
+def build_dashboard(
+    playback, track, file_size, session_tracks_ok, session_total_bytes,
+    session_start_time, track_history, failed_recordings,
+    sr, ch, bit_depth, hw_name, output_format, out_dir
+) -> Panel:
+    """Unified dashboard builder for both recording and idle states.
+    Eliminates duplicated UI code between recording and idle branches.
+    """
+    is_playing = playback and playback.get('is_playing') and track
+    cur_state = get_state()
+
+    dashboard = Table.grid(expand=True)
+
+    if is_playing:
+        # --- TRACK INFO WITH ALBUM ART ---
+        progress = playback.get('progress_ms', 0)
+        duration = track.get('duration_ms', 1)
+
+        # State indicator
+        if cur_state == STATE_RECORDING:
+            rec_indicator = f"[{SP_REC_RED}]REC ●[/{SP_REC_RED}]"
+        elif cur_state == STATE_SKIPPED:
+            rec_indicator = f"[{SP_SKIP_YELLOW}]SKIP ⏭[/{SP_SKIP_YELLOW}]"
+        elif cur_state == STATE_SWITCHING:
+            rec_indicator = "[yellow]⟳ Switching...[/yellow]"
+        else:
+            rec_indicator = "[yellow]WAIT[/yellow]"
+
+        # Build track info column
+        track_info = Table.grid(expand=True)
+        track_info.add_row(Text.from_markup(f"{rec_indicator}  [{SP_WHITE}]{track['name']}[/{SP_WHITE}]"))
+        track_info.add_row(Text(f"Artist: {track['artists'][0]['name']}", style=SP_GREY))
+        track_info.add_row(Text(f"Album:  {track['album']['name']}", style=SP_GREY))
+
+        # Progress bar with time labels
+        elapsed_str = format_time_ms(progress)
+        total_str = format_time_ms(duration)
+
+        progress_row = Table.grid(expand=True)
+        progress_row.add_column(width=6)
+        progress_row.add_column(ratio=1)
+        progress_row.add_column(width=6, justify="right")
+        progress_row.add_row(
+            Text(elapsed_str, style=SP_GREEN_DIM),
+            ProgressBar(total=duration, completed=progress, width=None,
+                        complete_style=SP_GREEN_DIM, finished_style=SP_GREEN_DIM),
+            Text(total_str, style=SP_DARK)
+        )
+        track_info.add_row(progress_row)
+
+        # Fetch ASCII album art and compose side-by-side layout
+        art_lines = fetch_album_art_ascii(track)
+        art_text = "\n".join(art_lines)
+
+        # Use a Columns-like layout: art on the left, track info on the right
+        layout_table = Table.grid(expand=True)
+        layout_table.add_column(width=14)  # album art
+        layout_table.add_column(ratio=1)   # track info
+        layout_table.add_row(Text.from_markup(art_text), track_info)
+
+        dashboard.add_row(layout_table)
+
+        if failed_recordings:
+            dashboard.add_row(Text(f"⚠️ Failed recordings: {len(failed_recordings)}", style="bold red"))
+
+        dashboard.add_section()
+
+        # --- STATUS STRIP ---
+        if cfg['UI'].getboolean('show_status_strip'):
+            safe_mode_active = cfg['Recording'].getboolean('force_safe_mode')
+            safe_tag = f"[{SP_SKIP_YELLOW}](SAFE) [/{SP_SKIP_YELLOW}]" if safe_mode_active else ""
+
+            status_items = []
+            if cfg['QualityDisplay'].getboolean('show_sample_rate'):
+                status_items.append(f"{sr}Hz")
+            if cfg['QualityDisplay'].getboolean('show_bit_depth'):
+                status_items.append(f"{bit_depth}-bit")
+            if cfg['QualityDisplay'].getboolean('show_channels'):
+                status_items.append(f"{ch}ch")
+
+            tech_info = " | ".join(status_items) if status_items else ""
+            status_line = f"{safe_tag}{tech_info} | {output_format.upper()} | {file_size}MB"
+            dashboard.add_row(Text.from_markup(f"[{SP_DARK}]⚙️ {status_line}[/{SP_DARK}]"))
+
+        # --- AUDIO METERS ---
+        if cfg['QualityDisplay'].getboolean('show_lr_meters'):
+            show_peak = cfg['QualityDisplay'].getboolean('show_peak_hold')
+            dashboard.add_row(Text.from_markup(f"[{SP_DARK}]L[/{SP_DARK}] {build_gradient_bar(smoothed_rms_l, peak_l, show_peak=show_peak)}"))
+            dashboard.add_row(Text.from_markup(f"[{SP_DARK}]R[/{SP_DARK}] {build_gradient_bar(smoothed_rms_r, peak_r, show_peak=show_peak)}"))
+
+            if mono_warning_frames > 30:
+                dashboard.add_row(Text("[yellow]⚠️ Warning: Possible mono input detected[/yellow]"))
+
+        health = get_health_indicator(peak_l)
+        dashboard.add_row(Text.from_markup(f"[{SP_DARK}]Signal:[/{SP_DARK}] {health}"))
+
+    else:
+        # --- IDLE SCREEN ---
+        idle_grid = Table.grid(expand=True)
+        idle_grid.add_row(Text.from_markup(f"[{SP_GREEN}]🎵 Waiting for Spotify...[/{SP_GREEN}]    [dim italic]Listening for audio ♪[/dim italic]"))
+        idle_grid.add_row(Text(f"Device: {hw_name} ({sr}Hz / {bit_depth}-bit / {ch}ch)", style=SP_DARK))
+
+        # Show ambient audio level even when idle
+        if smoothed_rms_l > 0.0001:
+            idle_grid.add_row(Text.from_markup(
+                f"[{SP_DARK}]Signal:[/{SP_DARK}] {build_gradient_bar(smoothed_rms_l, peak_l, width=30, show_peak=False)}"
+            ))
+
+        if failed_recordings:
+            idle_grid.add_row(Text(f"⚠️ Failed recordings: {len(failed_recordings)}", style="bold red"))
+
+        dashboard.add_row(idle_grid)
+
+    # --- DEBUG OVERLAY ---
+    if cfg['Debug'].getboolean('show_debug_overlay'):
+        dashboard.add_section()
+        pid = ffmpeg_process.pid if ffmpeg_process else 'None'
+        dashboard.add_row(Text.from_markup(
+            f"[dim]PID: {pid} | State: {cur_state} | L={raw_l:.3f} R={raw_r:.3f} | Mono frames: {mono_warning_frames}[/dim]"
+        ))
+
+    dashboard.add_section()
+
+    # --- SESSION STATISTICS ---
+    elapsed = time.time() - session_start_time
+    elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+    total_mb = round(session_total_bytes / (1024 ** 2), 1)
+    try:
+        disk_free = round(shutil.disk_usage(out_dir).free / (1024 ** 3), 1)
+        disk_str = f" | Disk: {disk_free} GB free"
+    except Exception:
+        disk_str = ""
+    stats_line = f"📊 {session_tracks_ok} tracks | {total_mb} MB | {elapsed_str}{disk_str}"
+    dashboard.add_row(Text.from_markup(f"[{SP_DARK}]{stats_line}[/{SP_DARK}]"))
+
+    # --- TRACK HISTORY ---
+    history_panel = build_history_table(track_history)
+    if history_panel:
+        dashboard.add_row(history_panel)
+
+    # --- SHORTCUT BAR ---
+    dashboard.add_row(build_shortcut_bar())
+
+    # --- SYSTEM LOG ---
+    if cfg['Diagnostics'].getboolean('enable_logging'):
+        logs = get_tail_logs(3)
+        if logs:
+            dashboard.add_row(Panel(
+                Text.from_markup(f"[dim]{logs}[/dim]"),
+                title=f"[{SP_DARK}]System Log[/{SP_DARK}]",
+                border_style=SP_DARK
+            ))
+
+    # --- PANEL WRAPPER ---
+    if is_playing and cur_state == STATE_RECORDING:
+        border_style = SP_BAR_BORDER
+        title_str = f"[{SP_GREEN}]SpytoRec v{SCRIPT_VERSION}[/{SP_GREEN}] [dim]— Recording[/dim]"
+    elif is_playing:
+        border_style = "yellow"
+        title_str = f"[{SP_GREEN}]SpytoRec v{SCRIPT_VERSION}[/{SP_GREEN}]"
+    else:
+        border_style = SP_IDLE_BORDER
+        title_str = f"[{SP_GREEN}]SpytoRec v{SCRIPT_VERSION}[/{SP_GREEN}]"
+
+    # Subtitle with device info
+    subtitle = f"[{SP_DARK}]{hw_name} • {output_format.upper()}[/{SP_DARK}]"
+
+    return Panel(dashboard, title=title_str, subtitle=subtitle, border_style=border_style)
 
 
 # --- 6. MAIN ENGINE ---
@@ -1245,8 +1607,8 @@ def main():
         hw_name, hw_idx, hw_sr, hw_ch = discover_hardware(args.ffmpeg)
 
     # Spotify initialisation
-    client_id = cfg['SpotifyAPI'].get('SPOTIPY_CLIENT_ID')
-    client_secret = cfg['SpotifyAPI'].get('SPOTIPY_CLIENT_SECRET')
+    client_id = cfg['SpotifyAPI'].get('spotipy_client_id')
+    client_secret = cfg['SpotifyAPI'].get('spotipy_client_secret')
 
     if not client_id or not client_secret:
         console.print("[red]Spotify Credentials Missing from config.ini![/red]")
@@ -1306,12 +1668,22 @@ def main():
     ch = int(cfg['Recording'].get('channels', '2'))
     bit_depth = cfg['Recording'].get('bit_depth', '24')
 
-    # Determine platform-specific FFmpeg input format
-    ffmpeg_input_fmt = get_ffmpeg_input_format()
+
 
     # Initialize keyboard listener for the main loop
     kb = KBHit()
     kb.set_cbreak()
+
+    # Start audio writer background thread
+    threading.Thread(target=audio_writer_worker, daemon=True).start()
+
+    # Start continuous audio monitor once at startup
+    safe_mode = cfg['Recording'].getboolean('force_safe_mode')
+    sr = 44100 if safe_mode else hw_sr
+    ch = 2 if safe_mode else hw_ch
+    start_monitor(hw_idx, sr, ch)
+
+
 
     set_state(STATE_MONITORING)
 
@@ -1319,10 +1691,33 @@ def main():
         with Live(Panel(Text("Waiting for Spotify...", style="yellow")), refresh_per_second=10) as live:
             while not stop_event.is_set():
                 try:
+                    # Check for error state set by watchdog and recover
+                    if get_state() == STATE_ERROR:
+                        logging.info("Main loop detected error state, attempting recovery...")
+                        with ffmpeg_lock:
+                            if ffmpeg_process and ffmpeg_process.poll() is not None:
+                                ffmpeg_process = None
+                            elif ffmpeg_process:
+                                safely_stop_ffmpeg(ffmpeg_process)
+                                ffmpeg_process = None
+                        if temp_file and temp_file.exists():
+                            try:
+                                temp_file.unlink()
+                            except Exception:
+                                pass
+                        temp_file = None
+                        current_track = None
+                        current_id = None
+                        current_track_id_ref = None
+                        set_state(STATE_RECOVERING)
+                        time.sleep(2)
+                        set_state(STATE_MONITORING)
+                        continue
+
                     # Get playback info with retry
                     playback = spotify_with_retry(sp)
 
-                    if playback and playback.get('is_playing'):
+                    if playback and playback.get('is_playing') and playback.get('item'):
                         track = playback['item']
                         track_id = track['id']
 
@@ -1331,8 +1726,7 @@ def main():
                             # Stop current recording if any
                             if ffmpeg_process:
                                 set_state(STATE_SWITCHING)
-                                stop_monitor_stream()
-
+                                
                                 with ffmpeg_lock:
                                     safely_stop_ffmpeg(ffmpeg_process)
                                     ffmpeg_process = None
@@ -1387,24 +1781,20 @@ def main():
                             fmt_map = {'16': 's16', '24': 's32', '32': 's32'}
                             sample_fmt = fmt_map.get(bit_depth, 's16')
 
-                            # Start audio monitor
-                            if not start_monitor(hw_idx, sr, ch):
-                                set_state(STATE_ERROR, "Audio Monitor Failed")
-                                time.sleep(3)
-                                continue
+                            # Clear old audio chunks to prevent stale audio in new file
+                            with audio_queue.mutex:
+                                audio_queue.queue.clear()
 
                             # Create temp file
                             temp_file = out_dir / f".tmp_{int(time.time())}.{output_format}"
 
-                            # Build cross-platform FFmpeg command
-                            device_arg = get_ffmpeg_device_arg(hw_name)
+                            # Build cross-platform FFmpeg command for piped raw PCM
                             cmd = [
                                 args.ffmpeg, '-y',
-                                '-f', ffmpeg_input_fmt,
-                                '-thread_queue_size', '512',
-                                '-i', device_arg,
-                                '-ac', str(ch),
-                                '-ar', str(sr)
+                                '-f', 'f32le',
+                                '-ar', str(sr),
+                                '-ac', str(min(2, ch)),
+                                '-i', 'pipe:0'
                             ]
                             
                             if output_format == 'mp3':
@@ -1426,7 +1816,7 @@ def main():
                                 with ffmpeg_lock:
                                     ffmpeg_process = subprocess.Popen(
                                         cmd,
-                                        stdin=subprocess.DEVNULL,
+                                        stdin=subprocess.PIPE,
                                         stdout=subprocess.DEVNULL,
                                         stderr=ff_log_ptr
                                     )
@@ -1461,107 +1851,18 @@ def main():
                             last_file_size_check = now
                         file_size = cached_file_size
 
-                        progress = playback.get('progress_ms', 0)
-                        duration = track.get('duration_ms', 1)
-
-                        dashboard = Table.grid(expand=True)
-
-                        if get_state() == STATE_RECORDING:
-                            rec_indicator = "[bold red]REC \u25cf[/bold red]"
-                        elif get_state() == STATE_SKIPPED:
-                            rec_indicator = "[bold yellow]SKIP \u23ed[/bold yellow]"
-                        else:
-                            rec_indicator = "[yellow]WAIT[/yellow]"
-
-                        dashboard.add_row(Text.from_markup(f"{rec_indicator}  [bold cyan]{track['name']}[/bold cyan]"))
-                        dashboard.add_row(Text(f"Artist: {track['artists'][0]['name']}", style="grey70"))
-                        dashboard.add_row(Text(f"Album: {track['album']['name']}", style="grey70"))
-
-                        dashboard.add_row(ProgressBar(total=duration, completed=progress, width=None))
-
-                        if failed_recordings:
-                            dashboard.add_row(Text(f"\u26a0\ufe0f Failed recordings: {len(failed_recordings)}", style="bold red"))
-
-                        dashboard.add_section()
-
-                        if cfg['UI'].getboolean('show_status_strip'):
-                            safe_mode_active = cfg['Recording'].getboolean('force_safe_mode')
-                            safe_tag = "[bold yellow](SAFE MODE) [/bold yellow]" if safe_mode_active else ""
-                            minutes = int(progress / 60000)
-                            seconds = int((progress / 1000) % 60)
-                            time_str = f"{minutes:02d}:{seconds:02d}"
-
-                            status_items = []
-                            if cfg['QualityDisplay'].getboolean('show_sample_rate'):
-                                status_items.append(f"{sr}Hz")
-                            if cfg['QualityDisplay'].getboolean('show_bit_depth'):
-                                status_items.append(f"{bit_depth}-bit")
-                            if cfg['QualityDisplay'].getboolean('show_channels'):
-                                status_items.append(f"{ch}ch")
-
-                            tech_info = " | ".join(status_items) if status_items else ""
-                            status_line = f"{safe_tag}{tech_info} | {time_str} | {file_size}MB"
-                            dashboard.add_row(Text.from_markup(f"\u2699\ufe0f {status_line}"))
-
-                        if cfg['QualityDisplay'].getboolean('show_lr_meters'):
-                            show_peak = cfg['QualityDisplay'].getboolean('show_peak_hold')
-                            dashboard.add_row(Text.from_markup(f"L {build_gradient_bar(smoothed_rms_l, peak_l, show_peak=show_peak)}"))
-                            dashboard.add_row(Text.from_markup(f"R {build_gradient_bar(smoothed_rms_r, peak_r, show_peak=show_peak)}"))
-
-                            if mono_warning_frames > 30:
-                                dashboard.add_row(Text("[yellow]\u26a0\ufe0f Warning: Possible mono input detected[/yellow]"))
-
-                        health = get_health_indicator(peak_l)
-                        dashboard.add_row(Text.from_markup(f"Signal Health: {health}"))
-
-                        if cfg['Debug'].getboolean('show_debug_overlay'):
-                            dashboard.add_section()
-                            pid = ffmpeg_process.pid if ffmpeg_process else 'None'
-                            state = get_state()
-                            dashboard.add_row(Text.from_markup(
-                                f"[dim]PID: {pid} | State: {state} | L={raw_l:.3f} R={raw_r:.3f} | Mono frames: {mono_warning_frames}[/dim]"
-                            ))
-
-                        dashboard.add_section()
-
-                        # Session statistics strip
-                        elapsed = time.time() - session_start_time
-                        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
-                        total_mb = round(session_total_bytes / (1024 ** 2), 1)
-                        try:
-                            disk_free = round(shutil.disk_usage(out_dir).free / (1024 ** 3), 1)
-                            disk_str = f" | Disk Free: {disk_free} GB"
-                        except Exception:
-                            disk_str = ""
-                        stats_line = f"\U0001f4ca Session: {session_tracks_ok} tracks | {total_mb} MB | {elapsed_str}{disk_str}"
-                        dashboard.add_row(Text.from_markup(f"[dim]{stats_line}[/dim]"))
-
-                        # Track history panel
-                        if track_history:
-                            history_table = Table.grid(expand=True)
-                            for entry in track_history:
-                                icon = "[green]\u2705[/green]" if entry['status'] == 'ok' else ("[yellow]\u23ed[/yellow]" if entry['status'] == 'skip' else "[red]\u274c[/red]")
-                                size_str = f"{entry['size']}MB" if entry['status'] == 'ok' else ("DUP" if entry['status'] == 'skip' else "FAIL")
-                                history_table.add_row(Text.from_markup(f"{icon} [dim]{entry['artist']}[/dim] - {entry['name']} [dim]{size_str}[/dim]"))
-                            dashboard.add_row(Panel(history_table, title="Recent Recordings", border_style="dim"))
-
-                        # Keyboard Shortcut Bar
-                        shortcuts = "[bold][Q][/bold] Quit | [bold][D][/bold] Toggle Debug | [bold][F][/bold] Toggle Safe Mode"
-                        dashboard.add_row(Text.from_markup(f"\n[dim]{shortcuts}[/dim]"))
-
-                        if cfg['Diagnostics'].getboolean('enable_logging'):
-                            logs = get_tail_logs(3)
-                            if logs:
-                                dashboard.add_row(Panel(Text.from_markup(f"[dim]{logs}[/dim]"), title="System Log", border_style="dim"))
-
-                        live.update(Panel(dashboard, title=f"SpytoRec v{SCRIPT_VERSION} - Recording", border_style="green"))
+                        live.update(build_dashboard(
+                            playback, track, file_size,
+                            session_tracks_ok, session_total_bytes,
+                            session_start_time, track_history, failed_recordings,
+                            sr, ch, bit_depth, hw_name, output_format, out_dir
+                        ))
 
                     else:
                         # Not playing - cleanup if needed
                         if ffmpeg_process:
                             set_state(STATE_STOPPING)
-                            stop_monitor_stream()
-
+                            
                             with ffmpeg_lock:
                                 safely_stop_ffmpeg(ffmpeg_process)
                                 ffmpeg_process = None
@@ -1589,48 +1890,12 @@ def main():
                             current_track_id_ref = None
                             set_state(STATE_IDLE)
 
-                        idle_dashboard = Table.grid(expand=True)
-                        idle_dashboard.add_row(Text("\U0001f3b5 Spotify Paused", style="bold yellow"))
-                        idle_dashboard.add_row(Text("Waiting for playback to start...", style="grey70"))
-
-                        if failed_recordings:
-                            idle_dashboard.add_section()
-                            idle_dashboard.add_row(Text(f"\u26a0\ufe0f Failed recordings: {len(failed_recordings)}", style="bold red"))
-
-                        idle_dashboard.add_section()
-
-                        # Session statistics strip (Idle)
-                        elapsed = time.time() - session_start_time
-                        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
-                        total_mb = round(session_total_bytes / (1024 ** 2), 1)
-                        try:
-                            disk_free = round(shutil.disk_usage(out_dir).free / (1024 ** 3), 1)
-                            disk_str = f" | Disk Free: {disk_free} GB"
-                        except Exception:
-                            disk_str = ""
-                        stats_line = f"\U0001f4ca Session: {session_tracks_ok} tracks | {total_mb} MB | {elapsed_str}{disk_str}"
-                        idle_dashboard.add_row(Text.from_markup(f"[dim]{stats_line}[/dim]"))
-
-                        # Track history panel (Idle)
-                        if track_history:
-                            history_table = Table.grid(expand=True)
-                            for entry in track_history:
-                                icon = "[green]\u2705[/green]" if entry['status'] == 'ok' else ("[yellow]\u23ed[/yellow]" if entry['status'] == 'skip' else "[red]\u274c[/red]")
-                                size_str = f"{entry['size']}MB" if entry['status'] == 'ok' else ("DUP" if entry['status'] == 'skip' else "FAIL")
-                                history_table.add_row(Text.from_markup(f"{icon} [dim]{entry['artist']}[/dim] - {entry['name']} [dim]{size_str}[/dim]"))
-                            idle_dashboard.add_row(Panel(history_table, title="Recent Recordings", border_style="dim"))
-
-                        # Keyboard Shortcut Bar
-                        shortcuts = "[bold][Q][/bold] Quit | [bold][D][/bold] Toggle Debug | [bold][F][/bold] Toggle Safe Mode"
-                        idle_dashboard.add_row(Text.from_markup(f"\n[dim]{shortcuts}[/dim]"))
-
-                        if cfg['Diagnostics'].getboolean('enable_logging'):
-                            idle_dashboard.add_section()
-                            logs = get_tail_logs(3)
-                            if logs:
-                                idle_dashboard.add_row(Panel(Text.from_markup(f"[dim]{logs}[/dim]"), title="System Log", border_style="dim"))
-
-                        live.update(Panel(idle_dashboard, title=f"SpytoRec v{SCRIPT_VERSION}", border_style="blue"))
+                        live.update(build_dashboard(
+                            playback, None, 0.0,
+                            session_tracks_ok, session_total_bytes,
+                            session_start_time, track_history, failed_recordings,
+                            sr, ch, bit_depth, hw_name, output_format, out_dir
+                        ))
 
                     # Adaptive polling: less frequent when idle, moderate when recording
                     if playback and playback.get('is_playing'):
@@ -1649,6 +1914,35 @@ def main():
                         elif key == 'f':
                             cfg['Recording']['force_safe_mode'] = str(not cfg['Recording'].getboolean('force_safe_mode'))
                             console.print("[yellow]Safe Mode toggled (will apply next track)[/yellow]")
+                        elif key == 's' and current_track:
+                            # Skip current track and add to blocklist
+                            track_name = current_track['name']
+                            track_skip_id = current_track.get('id', '')
+                            logging.info(f"User skipped track: {track_name}")
+                            try:
+                                blocklist_path = resolve_path('blocklist.txt')
+                                with open(blocklist_path, 'a', encoding='utf-8') as bl:
+                                    bl.write(f"id:{track_skip_id}\n")
+                                blocklist.append(f"id:{track_skip_id}")
+                                console.print(f"[yellow]Skipped & blocklisted: {track_name}[/yellow]")
+                            except Exception as e:
+                                logging.error(f"Failed to update blocklist: {e}")
+                            # Stop current recording without finalizing
+                            with ffmpeg_lock:
+                                if ffmpeg_process:
+                                    safely_stop_ffmpeg(ffmpeg_process)
+                                    ffmpeg_process = None
+                            if temp_file and temp_file.exists():
+                                try:
+                                    temp_file.unlink()
+                                except Exception:
+                                    pass
+                            temp_file = None
+                            track_history.append({'name': track_name, 'artist': current_track['artists'][0]['name'], 'size': 0, 'status': 'skip'})
+                            set_state(STATE_SKIPPED)
+                            current_track = None
+                            current_id = None
+                            current_track_id_ref = None
 
                 except SpotifyException as e:
                     logging.error(f"Spotify API error: {e}")
@@ -1680,9 +1974,9 @@ def main():
         elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
         total_mb = round(session_total_bytes / (1024 ** 2), 1)
 
-        summary = Table(title="[bold cyan]SpytoRec Session Summary[/bold cyan]", show_header=False, expand=True)
-        summary.add_column("Stat", style="yellow")
-        summary.add_column("Value", style="green")
+        summary = Table(title=f"[{SP_GREEN}]SpytoRec Session Summary[/{SP_GREEN}]", show_header=False, expand=True)
+        summary.add_column("Stat", style=SP_GREY)
+        summary.add_column("Value", style=SP_GREEN_DIM)
 
         summary.add_row("Duration:", elapsed_str)
         summary.add_row("Tracks:", f"{session_tracks_ok} recorded, {len(failed_recordings)} failed")
@@ -1691,12 +1985,18 @@ def main():
         summary.add_row("Output:", str(out_dir))
 
         console.print("\n")
-        console.print(Panel(summary, border_style="cyan"))
+        console.print(Panel(summary, border_style=SP_GREEN_DIM))
+
+        # Track-by-track breakdown
+        if track_history:
+            breakdown = build_history_table(track_history)
+            if breakdown:
+                console.print(breakdown)
 
         if failed_recordings:
             console.print(f"\n[yellow]Recording session completed with {len(failed_recordings)} failed tracks[/yellow]")
         else:
-            console.print("\n[green]Recording session completed successfully![/green]")
+            console.print(f"\n[{SP_GREEN}]Recording session completed successfully![/{SP_GREEN}]")
 
         if cfg['Webhooks'].getboolean('notify_on_session_end'):
             fail_str = f" ({len(failed_recordings)} failed)" if failed_recordings else ""

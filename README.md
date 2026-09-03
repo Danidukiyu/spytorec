@@ -26,99 +26,104 @@
 - 💬 Rich Terminal UI with Cross-Platform Keyboard Shortcuts
 - 🔔 Webhook Notifications for session monitoring
 - 🖥️ Cross-Platform: Windows, macOS, Linux
+- 📦 **V8.1.0+**: Installable Python package architecture (`pip install .`)
 
 ---
 
 ## 💻 Installation Guides
 
+SpytoRec v8.1.0+ is now an installable Python package.
+
 ### 🪟 Windows
 
-1. Install **Python 3.7+** from [python.org](https://www.python.org/downloads/windows/)
+1. Install **Python 3.8+** from [python.org](https://www.python.org/downloads/windows/)
 2. Install **FFmpeg**:
    - Download from [gyan.dev FFmpeg builds](https://www.gyan.dev/ffmpeg/builds/)
    - Extract it and add the `/bin` folder to your `PATH`
 3. Install **VB-Audio Cable** from [vb-audio.com](https://vb-audio.com/Cable/)
-4. Clone the repo and install requirements:
+4. Clone the repo and install the package:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/SpytoRec.git
-   cd SpytoRec
-   pip install -r requirements.txt
+   git clone https://github.com/Danidukiyu/spytorec.git
+   cd spytorec
+   pip install -e .
    ```
 5. Set Spotify output to **CABLE Input**, and run:
    ```bash
-   python SpytoRec_v8.0.0.py
+   spytorec
    ```
 
 ---
 
 ### 🍏 macOS
 
-1. Install **Python 3.7+** (via [Homebrew](https://brew.sh/) or [python.org](https://www.python.org/downloads/macos/))
+1. Install **Python 3.8+** (via [Homebrew](https://brew.sh/) or [python.org](https://www.python.org/downloads/macos/))
 2. Install **FFmpeg**:
    ```bash
    brew install ffmpeg
    ```
 3. Install **BlackHole (2ch)** via [BlackHole GitHub](https://github.com/ExistentialAudio/BlackHole)
 4. Set Spotify output to BlackHole in System Preferences > Sound > Output
-5. Clone and install dependencies:
+5. Clone and install the package:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/SpytoRec.git
-   cd SpytoRec
-   pip install -r requirements.txt
+   git clone https://github.com/Danidukiyu/spytorec.git
+   cd spytorec
+   pip install -e .
    ```
-6. Run the script:
+6. Run the tool:
    ```bash
-   python SpytoRec_v8.0.0.py
+   spytorec
    ```
 
 ---
 
 ### 🐧 Linux (PulseAudio)
 
-1. Install **Python 3.7+**, `ffmpeg`, and `pavucontrol`:
+1. Install **Python 3.8+**, `ffmpeg`, and `pavucontrol`:
    ```bash
    sudo apt update && sudo apt install python3 ffmpeg pavucontrol python3-pip
-   pip install spotipy requests mutagen rich
    ```
 2. Load PulseAudio null sink:
    ```bash
    pactl load-module module-null-sink sink_name=spytorec_sink
    ```
 3. Set Spotify output to **Monitor of spytorec_sink** using `pavucontrol`
-4. Clone repo and run:
+4. Clone repo and install:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/SpytoRec.git
-   cd SpytoRec
-   python3 SpytoRec_v8.0.0.py
+   git clone https://github.com/Danidukiyu/spytorec.git
+   cd spytorec
+   pip install -e .
+   ```
+5. Run the tool:
+   ```bash
+   spytorec
    ```
 
 ---
 
 ## 🛠️ Usage & CLI
 
-```bash
-python SpytoRec_v8.0.0.py [COMMAND] [OPTIONS]
-```
-
-### ▶️ `record` (or default)
-Records and saves current Spotify track with metadata.
-
-### 🎙️ `list-devices`
-Lists FFmpeg-detected audio input devices.
-
-### 🔐 `test-auth`
-Tests Spotify API credentials and shows current playback info.
-
----
-
-## 🧪 Example Commands
+With the new package architecture, you can run SpytoRec from anywhere in your terminal.
 
 ```bash
-python SpytoRec_v8.0.0.py                      # default run with config.ini
-python SpytoRec_v8.0.0.py record --format flac --organize
-python SpytoRec_v8.0.0.py list-devices
-python SpytoRec_v8.0.0.py test-auth
+spytorec
 ```
+
+Or run via Python module syntax:
+
+```bash
+python -m spytorec
+```
+
+On first run, SpytoRec will launch an **Interactive Hardware Discovery Wizard** to help you select your virtual audio cable. It will save this selection to `config.ini`.
+
+### CLI Options
+
+```bash
+spytorec --help
+  --ffmpeg FFMPEG  Path to ffmpeg executable (default: ffmpeg in PATH)
+```
+
+*(Note: The legacy single-file script is still available as `SpytoRec_v8.0.0.py` in the repository root for backward compatibility.)*
 
 ---
 
@@ -137,8 +142,8 @@ python SpytoRec_v8.0.0.py test-auth
 | Issue                        | Solution                                                            |
 |-----------------------------|---------------------------------------------------------------------|
 | No sound recorded           | Verify Spotify is routed to virtual device                         |
-| "Device not found"          | Run `list-devices` and use the full audio device name              |
-| Beginning cut off           | Lower `--interval` (e.g. 0.3 or 0.2)                               |
+| "Device not found"          | Re-run and use the Interactive Hardware Wizard to select the correct device |
+| Beginning cut off           | Lower `--interval` (e.g. 0.3 or 0.2) in config.ini                 |
 | Corrupted duration          | Ensure `ffmpeg` finalizer runs successfully                       |
 | Ads in recording            | Use Spotify Premium  (eventhough Ads won't recorded in Free Subscriptions)                                              |
 
@@ -155,7 +160,7 @@ Fork the repo, give it a star, and help build more useful tools for personal mus
 
 | Contributor | Contribution |
 |---|---|
-| [@electrodics-ship-it](https://github.com/electrodics-ship-it) | V8.0.0 optimized build — real-time audio metering, state machine, watchdog, rotating logs, 24-bit FLAC, and cross-platform improvements ([#6](https://github.com/Danidukiyu/spytorec/issues/6)) |
+| [@electrodics-ship-it](https://github.com/electrodics-ship-it) | V8.1.0 Python Package Architecture — Zero-latency streaming pipes, background watchdog, rich UI, and module refactoring. |
 
 ---
 

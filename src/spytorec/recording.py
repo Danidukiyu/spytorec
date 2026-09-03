@@ -1,0 +1,259 @@
+"""FFmpeg process control, file finalization, tagging, and watchdog."""
+
+import time
+import subprocess
+import logging
+import requests
+from pathlib import Path
+from typing import Dict
+
+from mutagen.flac import FLAC, Picture
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TYER, TRCK, APIC
+
+from spytorec import state
+from spytorec.utils import clean_filename
+
+
+def get_final_path(out_dir: Path, track_info: Dict, naming_format: str,
+                   output_format: str, cfg) -> tuple:
+    """Generates the target directory and final path for a track based on config rules.
+    Returns (target_dir, final_path).
+    """
+    artist = clean_filename(track_info['artists'][0]['name'])
+    album = clean_filename(track_info['album']['name'])
+    title = clean_filename(track_info['name'])
+    track_no = str(track_info.get('track_number', 0)).zfill(2)
+    year = track_info['album'].get('release_date', '0000')[:4]
+
+    tags = {
+        'artist': artist, 'album': album, 'title': title,
+        'track_no': track_no, 'year': year
+    }
+
+    organize_by = cfg['Naming'].get('organize_by', 'none').lower()
+    if organize_by == 'artist/album':
+        target_dir = out_dir / artist / album
+    elif organize_by == 'artist':
+        target_dir = out_dir / artist
+    else:
+        target_dir = out_dir
+
+    try:
+        final_name = naming_format.format(**tags)
+    except KeyError as e:
+        logging.warning(f"Missing tag in naming format: {e}, using fallback")
+        final_name = f"{track_no}. {artist} - {title}"
+
+    final_name = clean_filename(final_name)
+    final_path = target_dir / f"{final_name}.{output_format}"
+
+    return target_dir, final_path
+
+
+def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
+             naming_format: str, output_format: str, cfg) -> Dict:
+    """Tags and moves the recorded file with integrity checking.
+    Returns a dict with 'ok': bool, 'size_mb': float, 'path': str on success.
+    """
+    if not temp_file or not temp_file.exists():
+        return {'ok': False}
+
+    try:
+        # Verify file integrity
+        if cfg['SafetyChecks'].getboolean('validate_file_integrity'):
+            if temp_file.stat().st_size < 8192:
+                logging.warning(f"File too small, possible corruption: {temp_file}")
+                temp_file.unlink()
+                return {'ok': False}
+
+        # Wait a moment for file to be fully written
+        time.sleep(1.5)
+
+        target_dir, final_path = get_final_path(out_dir, track_info, naming_format, output_format, cfg)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Handle existing files
+        if final_path.exists():
+            if not cfg['Recording'].getboolean('overwrite_existing'):
+                timestamp = int(time.time())
+                final_path = target_dir / f"{final_path.stem}_{timestamp}.{output_format}"
+                logging.info(f"File exists, created: {final_path.name}")
+            else:
+                logging.info(f"Overwriting existing file: {final_path.name}")
+
+        year = track_info['album'].get('release_date', '0000')[:4]
+        track_no = str(track_info.get('track_number', 0)).zfill(2)
+
+        if output_format == 'mp3':
+            audio = MP3(temp_file, ID3=ID3)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.add(TIT2(encoding=3, text=track_info['name']))
+            audio.tags.add(TPE1(encoding=3, text=track_info['artists'][0]['name']))
+            audio.tags.add(TALB(encoding=3, text=track_info['album']['name']))
+            audio.tags.add(TYER(encoding=3, text=year))
+            audio.tags.add(TRCK(encoding=3, text=track_no))
+        else:
+            audio = FLAC(temp_file)
+            audio['title'] = track_info['name']
+            audio['artist'] = track_info['artists'][0]['name']
+            audio['album'] = track_info['album']['name']
+            audio['date'] = year
+            audio['tracknumber'] = track_no
+
+        # Add album art with content-type and size validation
+        if not cfg['Recording'].getboolean('force_safe_mode'):
+            try:
+                images = track_info['album'].get('images', [])
+                if images:
+                    img_url = images[0]['url']
+                    response = requests.get(img_url, timeout=3, stream=True)
+                    if response.status_code == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        content_length = response.headers.get('Content-Length')
+                        if content_length and int(content_length) > state.MAX_COVER_ART_BYTES:
+                            logging.warning(f"Album art Content-Length exceeds limit, skipping")
+                        elif content_type.startswith('image/'):
+                            chunks = []
+                            total_size = 0
+                            for chunk in response.iter_content(chunk_size=65536):
+                                chunks.append(chunk)
+                                total_size += len(chunk)
+                                if total_size > state.MAX_COVER_ART_BYTES:
+                                    logging.warning(f"Album art exceeds size limit, skipping")
+                                    chunks = []
+                                    break
+                            img_data = b''.join(chunks)
+                            if img_data:
+                                mime = content_type.split(';')[0].strip()
+                                if output_format == 'mp3':
+                                    audio.tags.add(
+                                        APIC(encoding=3, mime=mime, type=3, desc='Cover', data=img_data)
+                                    )
+                                else:
+                                    picture = Picture()
+                                    picture.data = img_data
+                                    picture.type = 3
+                                    picture.mime = mime
+                                    picture.desc = "Cover Art"
+                                    audio.add_picture(picture)
+                                logging.debug("Added album art")
+                        else:
+                            logging.warning(f"Unexpected content type for album art: {content_type}")
+            except Exception as e:
+                logging.debug(f"Could not add album art: {e}")
+
+        audio.save()
+
+        # Move to final location
+        temp_file.replace(final_path)
+        size_mb = round(final_path.stat().st_size / (1024 ** 2), 2)
+        logging.info(f"Finalised: {final_path.name}")
+        return {'ok': True, 'size_mb': size_mb, 'path': str(final_path.name)}
+
+    except Exception as e:
+        logging.exception(f"Finalise Error: {e}")
+        try:
+            if temp_file and temp_file.exists():
+                temp_file.unlink()
+        except Exception:
+            pass
+        return {'ok': False}
+
+
+def safely_stop_ffmpeg(proc) -> None:
+    """Shutdown protocol for FFmpeg with proper stdin pipe closure.
+    Closes stdin first to signal EOF, letting FFmpeg flush its output buffer
+    and finalize the file header. Then terminates if it doesn't exit on its own.
+    """
+    if not proc or proc.poll() is not None:
+        return
+
+    try:
+        # Step 1: Close stdin pipe to signal EOF to FFmpeg.
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+        # Step 2: Wait for FFmpeg to exit gracefully after receiving EOF.
+        try:
+            proc.wait(timeout=5)
+            logging.info("FFmpeg stopped gracefully via stdin EOF")
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Step 3: FFmpeg didn't exit after EOF, send SIGTERM.
+        logging.warning("FFmpeg didn't exit after stdin close, sending SIGTERM...")
+        proc.terminate()
+
+        try:
+            proc.wait(timeout=5)
+            logging.info("FFmpeg stopped after SIGTERM")
+        except subprocess.TimeoutExpired:
+            logging.warning("FFmpeg didn't respond to SIGTERM, killing...")
+            proc.kill()
+            proc.wait()
+            logging.warning("FFmpeg killed")
+
+    except Exception as e:
+        logging.error(f"Error stopping FFmpeg: {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def watchdog_worker(cfg) -> None:
+    """Monitors health of recording threads and FFmpeg."""
+    last_sz = 0
+    stalled_count = 0
+    no_heartbeat_count = 0
+
+    while not state.stop_event.is_set():
+        try:
+            time.sleep(2.0)
+
+            if not cfg['Debug'].getboolean('watchdog_enabled'):
+                continue
+
+            current_state_val = state.get_state()
+
+            # Check heartbeat
+            if current_state_val == state.STATE_RECORDING:
+                if time.time() - state.last_heartbeat > state.HEARTBEAT_TIMEOUT:
+                    no_heartbeat_count += 1
+                    if no_heartbeat_count >= 3:
+                        logging.error("Audio stream heartbeat lost")
+                        state.set_state(state.STATE_ERROR, "Audio stream lost")
+                else:
+                    no_heartbeat_count = 0
+
+            # Check FFmpeg process
+            with state.ffmpeg_lock:
+                if state.ffmpeg_process and state.ffmpeg_process.poll() is not None:
+                    returncode = state.ffmpeg_process.poll()
+                    logging.error(f"FFmpeg terminated with code {returncode}")
+                    state.set_state(state.STATE_ERROR, f"FFmpeg terminated (code {returncode})")
+
+            # Check file growth
+            if current_state_val == state.STATE_RECORDING and state.watchdog_file_ref and state.watchdog_file_ref.exists():
+                try:
+                    sz = state.watchdog_file_ref.stat().st_size
+                    if sz == last_sz and sz > 0:
+                        stalled_count += 1
+                        if stalled_count >= 3:
+                            logging.error("Recording file stalled for 6+ seconds, triggering recovery")
+                            state.set_state(state.STATE_ERROR, "Recording stalled")
+                            stalled_count = 0
+                    else:
+                        stalled_count = 0
+                        last_sz = sz
+                except Exception as e:
+                    logging.debug(f"File size check failed: {e}")
+
+        except Exception as e:
+            logging.error(f"Watchdog error: {e}")

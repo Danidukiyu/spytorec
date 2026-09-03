@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spytorec"
+version = "8.1.0"
+description = "Record Spotify audio streams to high-quality FLAC with automatic track detection, metadata embedding, and album art."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Darkphoenix", email = "darkphoenix@users.noreply.github.com"},
+]
+keywords = ["spotify", "recorder", "flac", "audio", "music"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = [
+    "spotipy>=2.23.0",
+    "requests>=2.31.0",
+    "mutagen>=1.47.0",
+    "rich>=13.7.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.26.0",
+    "Pillow>=10.2.0",
+]
+
+[project.scripts]
+spytorec = "spytorec.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Danidukiyu/spytorec"
+Repository = "https://github.com/Danidukiyu/spytorec"
+
+[tool.setuptools.packages.find]
+where = ["src"]
