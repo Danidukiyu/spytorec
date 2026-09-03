@@ -110,43 +110,71 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, int, int, int]:
 
         return Panel(t, subtitle=f"[{SP_GREY}]Selection: {buf}[/{SP_GREY}]", border_style=SP_GREEN_DIM), rows
 
-    console.print("[yellow]Press number keys to select device, Enter to confirm[/yellow]")
+    console.print("[yellow]Press a number key to pick a device (Enter to confirm a multi-digit number)[/yellow]")
 
-    with Live(build_hw_table()[0], refresh_per_second=10, screen=True) as live:
-        while not selected:
-            try:
-                panel, rows = build_hw_table()
-                live.update(panel)
+    def apply_key(c):
+        """Feed one character into the selection buffer. Returns a chosen row or None."""
+        nonlocal buf
+        if c in ('\r', '\n'):
+            if buf.isdigit() and int(buf) in rows:
+                return rows[int(buf)]
+            buf = ""
+        elif c in ('\x7f', '\x08'):
+            buf = buf[:-1]
+        elif c.isdigit():
+            buf += c
+            # Auto-confirm as soon as the buffer is an unambiguous complete match
+            # (i.e. no longer device number starts with these digits).
+            if int(buf) in rows and not any(
+                str(k).startswith(buf) and len(str(k)) > len(buf) for k in rows
+            ):
+                return rows[int(buf)]
+        return None
 
-                if os.name == 'nt':
-                    if msvcrt.kbhit():
-                        c = msvcrt.getch()
-                        if c in [b'\r', b'\n']:
-                            if buf.isdigit() and int(buf) in rows:
-                                selected = rows[int(buf)]
-                            buf = ""
-                        elif c == b'\x08':
-                            buf = buf[:-1]
-                        elif c.isdigit():
-                            buf += c.decode()
-                else:
-                    if select.select([sys.stdin], [], [], 0.05)[0]:
-                        c = sys.stdin.read(1)
-                        if c in ['\r', '\n']:
-                            if buf.isdigit() and int(buf) in rows:
-                                selected = rows[int(buf)]
-                            buf = ""
-                        elif c == '\x7f':
-                            buf = buf[:-1]
-                        elif c.isdigit():
-                            buf += c
+    # cbreak + raw os.read() here: select() plus buffered sys.stdin.read()
+    # strands bytes in Python's buffer and the wizard hangs.
+    kb = None
+    if os.name != 'nt':
+        try:
+            kb = KBHit()
+            kb.set_cbreak()
+        except Exception as e:
+            # stdin isn't a real terminal (piped/redirected) — os.read still works.
+            logging.debug(f"Could not set cbreak for hardware wizard: {e}")
+            kb = None
 
-                time.sleep(0.05)
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                console.print(f"[red]Selection error: {e}[/red]")
-                time.sleep(1)
+    try:
+        with Live(build_hw_table()[0], refresh_per_second=10, screen=True) as live:
+            while not selected:
+                try:
+                    panel, rows = build_hw_table()
+                    live.update(panel)
+
+                    if os.name == 'nt':
+                        while msvcrt.kbhit() and not selected:
+                            c = msvcrt.getch()
+                            if c in (b'\r', b'\n', b'\x08') or c.isdigit():
+                                selected = apply_key(c.decode('ascii', 'ignore')) or selected
+                    else:
+                        if select.select([sys.stdin], [], [], 0.05)[0]:
+                            try:
+                                chunk = os.read(sys.stdin.fileno(), 64).decode('utf-8', 'ignore')
+                            except (OSError, BlockingIOError):
+                                chunk = ""
+                            for c in chunk:
+                                selected = apply_key(c) or selected
+                                if selected:
+                                    break
+
+                    time.sleep(0.05)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    logging.debug(f"Hardware selection error: {e}")
+                    time.sleep(0.2)
+    finally:
+        if kb is not None:
+            kb.set_normal_term()
 
     # Cleanup streams
     for s in streams:

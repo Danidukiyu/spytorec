@@ -477,6 +477,27 @@ def main():
                     last_error_time = state.handle_error_recovery(e, last_error_time, error_recovery_delay)
 
     finally:
+        # Finalise a recording still in progress at shutdown (e.g. 'q' mid-track),
+        # otherwise its .tmp file is left untagged and unnamed.
+        with state.ffmpeg_lock:
+            if state.ffmpeg_process:
+                safely_stop_ffmpeg(state.ffmpeg_process)
+                state.ffmpeg_process = None
+        if temp_file and current_track and temp_file.exists():
+            try:
+                result = finalize(temp_file, out_dir, current_track, naming_format, output_format, cfg)
+                if result['ok']:
+                    session_tracks_ok += 1
+                    session_total_bytes += int(result['size_mb'] * 1024 * 1024)
+                    track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': result['size_mb'], 'status': 'ok'})
+                    logging.info(f"Saved on exit: {current_track['name']}")
+                    console.print(f"[green]✓ Saved: {current_track['name']}[/green]")
+                else:
+                    state.failed_recordings.append(current_track['name'])
+            except Exception as e:
+                logging.error(f"Finalise-on-exit failed: {e}")
+            temp_file = None
+
         if ff_log_ptr != subprocess.DEVNULL:
             try:
                 ff_log_ptr.close()
