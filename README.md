@@ -149,6 +149,32 @@ spytorec --help
 
 ---
 
+## 🗺️ Roadmap & Future Architecture
+
+With the v8.1.0 modular package foundation in place, here are the major architectural upgrades planned for the future. Pull requests for any of these are highly encouraged!
+
+### 1. Eliminate Virtual Cables (WASAPI Loopback)
+* **Goal:** Make the app "plug-and-play" without requiring users to install VB-Cable or BlackHole.
+* **How:** Leverage `sounddevice` WASAPI loopback support (Windows) to capture audio directly from the default speaker output (what the user actually hears).
+
+### 2. Eliminate FFmpeg Dependency (Native Encoding)
+* **Goal:** Remove the requirement for users to install and configure `ffmpeg.exe` in their system PATH.
+* **How:** Since we already capture raw PCM float32 data in Python via `numpy`, we can use `soundfile` (which wraps `libsndfile`) to encode directly to FLAC natively within Python. Zero subprocesses, zero broken pipes.
+
+### 3. Zero-Latency Track Changes (OS Media APIs)
+* **Goal:** Stop polling the Spotify Web API (which eats quotas and causes delays) and achieve instant track splitting.
+* **How:** Hook into the OS-level media events (Windows System Media Transport Controls or macOS Now Playing APIs) to get zero-latency event triggers the exact millisecond a track changes.
+
+### 4. Standalone Executable
+* **Goal:** Allow non-developers to run SpytoRec without installing Python or `pip`.
+* **How:** Use `PyInstaller` or `Nuitka` to compile the entire Python package into a single, portable `SpytoRec.exe` executable.
+
+### 5. Interactive TUI
+* **Goal:** Upgrade from a static logging UI to a fully interactive terminal application.
+* **How:** Migrate from `rich` to `Textual` to add mouse support, clickable tabs, scrolling logs, and a built-in interactive settings menu.
+
+---
+
 ## 🤝 Contributing
 
 Pull requests and stars ⭐ are welcome!  
