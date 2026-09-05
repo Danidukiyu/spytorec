@@ -213,6 +213,30 @@ def main():
     session_total_bytes = 0
     track_history = deque(maxlen=8)
 
+    def save_current(track, tmp):
+        """Tags and files a finished recording, and records it in the session.
+
+        The one path a completed recording takes, whether the track changed,
+        playback stopped, or SpytoRec is shutting down.
+        """
+        nonlocal session_tracks_ok, session_total_bytes
+
+        result = finalize(tmp, out_dir, track, naming_format, output_format, cfg)
+        artist = track['artists'][0]['name']
+
+        if result['ok']:
+            session_tracks_ok += 1
+            session_total_bytes += int(result['size_mb'] * 1024 * 1024)
+            track_history.append({'name': track['name'], 'artist': artist, 'size': result['size_mb'], 'status': 'ok'})
+            logging.info(f"Saved: {track['name']}")
+            console.print(f"[green]\u2713 Saved: {track['name']}[/green]")
+            if cfg['Webhooks'].getboolean('notify_on_track_saved'):
+                send_webhook(f"✅ **Saved:** `{artist} - {track['name']}` ({result['size_mb']} MB)", cfg)
+        else:
+            track_history.append({'name': track['name'], 'artist': artist, 'size': 0, 'status': 'fail'})
+            state.failed_recordings.append(track['name'])
+            console.print(f"[red]\u2717 Failed to save: {track['name']}[/red]")
+
     # Initialize recording params
     sr = int(cfg['Recording'].get('sample_rate', '48000'))
     ch = int(cfg['Recording'].get('channels', '2'))
@@ -278,14 +302,7 @@ def main():
                                     state.ffmpeg_process = None
 
                                 if temp_file and current_track:
-                                    result = finalize(temp_file, out_dir, current_track, naming_format, output_format, cfg)
-                                    if result['ok']:
-                                        track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': result['size_mb'], 'status': 'ok'})
-                                        session_tracks_ok += 1
-                                        session_total_bytes += int(result['size_mb'] * 1024 * 1024)
-                                    else:
-                                        track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': 0, 'status': 'fail'})
-                                        state.failed_recordings.append(current_track['name'])
+                                    save_current(current_track, temp_file)
                                     temp_file = None
 
                             # Check for duplicates before starting recording
@@ -407,20 +424,7 @@ def main():
                                 state.ffmpeg_process = None
 
                             if temp_file and current_track:
-                                result = finalize(temp_file, out_dir, current_track, naming_format, output_format, cfg)
-                                if result['ok']:
-                                    track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': result['size_mb'], 'status': 'ok'})
-                                    session_tracks_ok += 1
-                                    session_total_bytes += int(result['size_mb'] * 1024 * 1024)
-                                    logging.info(f"Saved: {current_track['name']}")
-                                    console.print(f"[green]\u2713 Saved: {current_track['name']}[/green]")
-
-                                    if cfg['Webhooks'].getboolean('notify_on_track_saved'):
-                                        send_webhook(f"✅ **Saved:** `{current_track['artists'][0]['name']} - {current_track['name']}` ({result['size_mb']} MB)", cfg)
-                                else:
-                                    track_history.append({'name': current_track['name'], 'artist': current_track['artists'][0]['name'], 'size': 0, 'status': 'fail'})
-                                    state.failed_recordings.append(current_track['name'])
-                                    console.print(f"[red]\u2717 Failed to save: {current_track['name']}[/red]")
+                                save_current(current_track, temp_file)
 
                             temp_file = None
                             current_track = None
@@ -495,6 +499,19 @@ def main():
                     last_error_time = state.handle_error_recovery(e, last_error_time, error_recovery_delay)
 
     finally:
+        # Finalise a recording still in progress at shutdown (e.g. 'q' mid-track),
+        # otherwise its .tmp file is left untagged and unnamed.
+        with state.ffmpeg_lock:
+            if state.ffmpeg_process:
+                safely_stop_ffmpeg(state.ffmpeg_process)
+                state.ffmpeg_process = None
+        if temp_file and current_track and temp_file.exists():
+            try:
+                save_current(current_track, temp_file)
+            except Exception as e:
+                logging.error(f"Finalise-on-exit failed: {e}")
+            temp_file = None
+
         if ff_log_ptr != subprocess.DEVNULL:
             try:
                 ff_log_ptr.close()
