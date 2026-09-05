@@ -3,6 +3,7 @@
 import os
 import sys
 import re
+from collections import deque
 from pathlib import Path
 from contextlib import contextmanager
 import logging
@@ -111,24 +112,47 @@ class KBHit:
     """Cross-platform non-blocking keyboard listener."""
 
     def __init__(self):
+        self._pending = deque()
+        self.old_term = None
         if os.name != 'nt':
             self.fd = sys.stdin.fileno()
-            self.old_term = termios.tcgetattr(self.fd)
+            try:
+                self.old_term = termios.tcgetattr(self.fd)
+            except termios.error as e:
+                # stdin is a pipe or a file: it has no terminal settings to
+                # change, and os.read() still delivers what is there.
+                logging.debug(f"stdin is not a terminal: {e}")
 
     def set_normal_term(self):
-        if os.name != 'nt':
+        if os.name != 'nt' and self.old_term is not None:
             termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.old_term)
 
     def set_cbreak(self):
-        if os.name != 'nt':
+        if os.name != 'nt' and self.old_term is not None:
             tty.setcbreak(self.fd)
+
+    def _drain(self):
+        """Moves whatever the terminal has ready into the pending buffer.
+
+        Reads the raw fd rather than sys.stdin: select() reports on the fd
+        alone, so characters sys.stdin has already decoded into its own buffer
+        are invisible to it and every character after the first of a burst is
+        stranded there.
+        """
+        while select.select([self.fd], [], [], 0)[0]:
+            try:
+                chunk = os.read(self.fd, 64)
+            except (OSError, BlockingIOError):
+                break
+            if not chunk:
+                break
+            self._pending.extend(chunk.decode('utf-8', 'ignore'))
 
     def kbhit(self):
         if os.name == 'nt':
             return msvcrt.kbhit()
-        else:
-            dr, dw, de = select.select([sys.stdin], [], [], 0)
-            return dr != []
+        self._drain()
+        return bool(self._pending)
 
     def getch(self):
         if os.name == 'nt':
@@ -137,5 +161,5 @@ class KBHit:
                 return c.decode('utf-8').lower()
             except Exception:
                 return ''
-        else:
-            return sys.stdin.read(1).lower()
+        self._drain()
+        return self._pending.popleft().lower() if self._pending else ''
