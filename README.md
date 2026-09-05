@@ -162,8 +162,8 @@ With the v8.1.0 modular package foundation in place, here are the major architec
 * **How:** Since we already capture raw PCM float32 data in Python via `numpy`, we can use `soundfile` (which wraps `libsndfile`) to encode directly to FLAC natively within Python. Zero subprocesses, zero broken pipes.
 
 ### 3. Zero-Latency Track Changes (OS Media APIs)
-* **Goal:** Stop polling the Spotify Web API (which eats quotas and causes delays) and achieve instant track splitting.
-* **How:** Hook into the OS-level media events (Windows System Media Transport Controls or macOS Now Playing APIs) to get zero-latency event triggers the exact millisecond a track changes.
+* **Goal:** Stop depending on the Spotify Web API on Linux (quota limits, latency, and now blocked entirely for non-Premium accounts) and read playback from the OS / local Spotify app instead, like Windows and macOS.
+* **How:** Hook into the OS-level media events (on Linux, `PropertiesChanged` signals from `org.mpris.MediaPlayer2.spotify` over MPRIS/D-Bus, which also carries real Spotify track ids and cover art urls) to get zero-latency event triggers the exact millisecond a track changes.
 
 ### 4. Standalone Executable
 * **Goal:** Allow non-developers to run SpytoRec without installing Python or `pip`.

@@ -7,7 +7,6 @@ import logging
 from typing import Dict, List, Optional
 
 import numpy as np
-import requests
 from PIL import Image
 from rich.text import Text
 from rich.table import Table
@@ -15,7 +14,7 @@ from rich.panel import Panel
 from rich.progress_bar import ProgressBar
 
 from spytorec import state
-from spytorec.utils import resolve_path
+from spytorec.utils import resolve_path, fetch_image_bytes
 
 # --- Spotify-Branded Color Theme ---
 SP_GREEN = "bold #1DB954"
@@ -111,12 +110,12 @@ def fetch_album_art_ascii(track: Dict, width: int = 12, height: int = 6) -> List
             return blank
 
         img_url = images[-1]['url']
-        response = requests.get(img_url, timeout=2)
-        if response.status_code != 200:
+        img_data = fetch_image_bytes(img_url, timeout=2)
+        if not img_data:
             _album_art_cache[track_id] = blank
             return blank
 
-        img = Image.open(io.BytesIO(response.content)).convert('RGB')
+        img = Image.open(io.BytesIO(img_data)).convert('RGB')
         img = img.resize((width, height * 2), Image.LANCZOS)
 
         lines = []

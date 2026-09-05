@@ -5,6 +5,7 @@ import sys
 import re
 from pathlib import Path
 from contextlib import contextmanager
+from typing import Optional
 import logging
 
 # Platform-specific imports
@@ -49,6 +50,66 @@ def clean_filename(name: str) -> str:
     if len(cleaned) > 200:
         cleaned = cleaned[:200]
     return cleaned or "unknown"
+
+
+# Magic-byte signatures for the image formats album art actually arrives in.
+_IMAGE_SIGNATURES = (
+    (b'\xff\xd8\xff', 'image/jpeg'),
+    (b'\x89PNG\r\n\x1a\n', 'image/png'),
+    (b'BM', 'image/bmp'),
+    (b'GIF87a', 'image/gif'),
+    (b'GIF89a', 'image/gif'),
+)
+
+
+def sniff_image_mime(data: bytes) -> Optional[str]:
+    """Identifies an image's MIME type from its leading bytes.
+    Needed for sources with no HTTP Content-Type header (e.g. local thumbnails).
+    """
+    for signature, mime in _IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return mime
+    return None
+
+
+def fetch_image_bytes(url: str, timeout: float = 3.0,
+                       max_bytes: int = 2 * 1024 * 1024) -> Optional[bytes]:
+    """Fetches image bytes from an http(s):// or file:// URL, size/timeout
+    capped. file:// covers the Windows SMTC source's local thumbnails.
+    Returns None on any failure, oversize response, or unsupported scheme.
+    """
+    if not url:
+        return None
+
+    if url.startswith('file://'):
+        try:
+            from urllib.parse import urlparse
+            from urllib.request import url2pathname
+            # url2pathname resolves Windows' file:///C:/... form and unquotes
+            path = Path(url2pathname(urlparse(url).path))
+            if not path.is_file() or path.stat().st_size > max_bytes:
+                return None
+            return path.read_bytes()
+        except OSError as e:
+            logging.debug(f"Local image read failed: {e}")
+            return None
+
+    try:
+        import requests
+        response = requests.get(url, timeout=timeout, stream=True)
+        if response.status_code != 200:
+            return None
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+            chunks.append(chunk)
+        return b''.join(chunks)
+    except Exception as e:
+        logging.debug(f"Image fetch failed: {e}")
+        return None
 
 
 @contextmanager
