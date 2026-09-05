@@ -12,8 +12,6 @@ import logging
 from collections import deque
 
 import sounddevice as sd
-from spotipy import Spotify
-from spotipy.oauth2 import SpotifyOAuth
 from spotipy.exceptions import SpotifyException
 from rich.text import Text
 from rich.panel import Panel
@@ -30,7 +28,7 @@ from spytorec.audio import (
 from spytorec.recording import (
     get_final_path, finalize, safely_stop_ffmpeg, watchdog_worker
 )
-from spytorec.spotify import spotify_with_retry
+from spytorec.sources import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
 from spytorec.webhooks import send_webhook
 from spytorec.hardware import discover_hardware
@@ -157,28 +155,12 @@ def main():
     else:
         hw_name, hw_idx, hw_sr, hw_ch = discover_hardware(args.ffmpeg, cfg)
 
-    # Spotify initialisation
-    client_id = cfg['SpotifyAPI'].get('spotipy_client_id')
-    client_secret = cfg['SpotifyAPI'].get('spotipy_client_secret')
-
-    if not client_id or not client_secret:
-        console.print("[red]Spotify Credentials Missing from config.ini![/red]")
-        console.print("Please add your Spotify API credentials to config.ini under [SpotifyAPI].")
-        time.sleep(5)
-        sys.exit(1)
-
+    # Track source: the platform's OS media app (Spotify Web API on Linux as fallback)
     try:
-        sp = Spotify(auth_manager=SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=state.SPOTIPY_REDIRECT_URI,
-            scope=state.SPOTIPY_SCOPE,
-            open_browser=True
-        ))
-        sp.current_user()
-        console.print("[green]Spotify authentication successful![/green]")
+        source = get_source(cfg)
     except Exception as e:
-        console.print(f"[red]Failed to authenticate with Spotify: {e}[/red]")
+        console.print(f"[red]Could not initialise a track source: {e}[/red]")
+        console.print("Make sure the Spotify desktop app is running and playing. On Linux, add credentials under [SpotifyAPI].")
         time.sleep(5)
         sys.exit(1)
 
@@ -260,8 +242,8 @@ def main():
                         state.set_state(state.STATE_MONITORING)
                         continue
 
-                    # Get playback info with retry
-                    playback = spotify_with_retry(sp)
+                    # Get playback info from the active track source
+                    playback = source.get_playback()
 
                     if playback and playback.get('is_playing') and playback.get('item'):
                         track = playback['item']
@@ -500,6 +482,11 @@ def main():
                 ff_log_ptr.close()
             except Exception:
                 pass
+
+        try:
+            source.close()
+        except Exception:
+            pass
 
         kb.set_normal_term()
         watchdog_thread.join(timeout=2)
