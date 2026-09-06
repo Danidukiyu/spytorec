@@ -17,12 +17,13 @@ STATE_ERROR = 'Error'
 STATE_IDLE = 'Idle'
 STATE_SKIPPED = 'Skipped'
 
+# Each state lists every state the main loop can move it to.
 VALID_STATE_TRANSITIONS = {
     STATE_INIT: {STATE_IDLE, STATE_ERROR, STATE_MONITORING},
     STATE_IDLE: {STATE_MONITORING, STATE_RECORDING, STATE_ERROR, STATE_SKIPPED},
     STATE_MONITORING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR, STATE_SKIPPED, STATE_SWITCHING},
-    STATE_RECORDING: {STATE_SWITCHING, STATE_STOPPING, STATE_ERROR, STATE_RECOVERING},
-    STATE_SWITCHING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR},
+    STATE_RECORDING: {STATE_SWITCHING, STATE_STOPPING, STATE_SKIPPED, STATE_ERROR, STATE_RECOVERING},
+    STATE_SWITCHING: {STATE_RECORDING, STATE_SKIPPED, STATE_IDLE, STATE_ERROR},
     STATE_STOPPING: {STATE_IDLE, STATE_ERROR},
     STATE_ERROR: {STATE_RECOVERING, STATE_IDLE, STATE_ERROR},
     STATE_RECOVERING: {STATE_IDLE, STATE_MONITORING, STATE_ERROR},
@@ -73,26 +74,29 @@ def set_state(new_state: str, msg: str = "") -> bool:
 
     with state_lock:
         old_state = current_state
+
+        # Re-entering the current state is not a transition.
+        if new_state == old_state:
+            return False
+
         allowed_states = VALID_STATE_TRANSITIONS.get(old_state, set())
 
         if new_state not in allowed_states:
             logging.warning(f"Invalid state transition: {old_state} -> {new_state}")
             return False
 
-        if new_state != old_state:
-            logging.info(f"State: {old_state} -> {new_state} {f'[{msg}]' if msg else ''}")
-            current_state = new_state
+        logging.info(f"State: {old_state} -> {new_state} {f'[{msg}]' if msg else ''}")
+        current_state = new_state
 
-            if new_state == STATE_ERROR:
-                last_error_msg = msg
-                error_count += 1
-            elif new_state == STATE_RECOVERING:
-                error_count = max(0, error_count - 1)
-            elif new_state == STATE_IDLE:
-                error_count = 0
+        if new_state == STATE_ERROR:
+            last_error_msg = msg
+            error_count += 1
+        elif new_state == STATE_RECOVERING:
+            error_count = max(0, error_count - 1)
+        elif new_state == STATE_IDLE:
+            error_count = 0
 
-            return True
-        return False
+        return True
 
 
 def get_state() -> str:
