@@ -19,6 +19,7 @@
 
 - 🎵 Real-Time Recording (FLAC or OGG/MP3)
 - 🎯 Zero-API Track Monitoring (via OS Media Events)
+- ⏪ Boundary Tracking: opens each recording on the track's first beat, however late the change is reported
 - 🔌 Zero-Config Audio Capture (WASAPI Loopback - No Virtual Cables needed!)
 - 🎼 Native FLAC Encoding (`soundfile`) — Zero FFmpeg dependency required for FLAC
 - 🎼 Metadata Embedding: title, artist, album, and cover art
@@ -138,7 +139,8 @@ spytorec --help
 |-----------------------------|---------------------------------------------------------------------|
 | No sound recorded           | Verify Spotify is routed to virtual device                         |
 | "Device not found"          | Re-run and use the Interactive Hardware Wizard to select the correct device |
-| Beginning cut off           | Lower `--interval` (e.g. 0.3 or 0.2) in config.ini                 |
+| Beginning cut off           | Raise `preroll_seconds` in config.ini (default 5) - how much played audio is kept to open a recording with |
+| Previous track bleeding in  | Lower `capture_delay_ms` (default 600) - how long the previous track keeps draining after Spotify reports the change - or narrow `boundary_window_ms` (default 800) |
 | Recording is far too quiet  | macOS: the system slider attenuates the loopback itself. SpytoRec pins it to unity gain - set `force_unity_gain = false` in config.ini to opt out |
 | Corrupted duration          | Ensure `ffmpeg` finalizer runs successfully                       |
 | Ads in recording            | Use Spotify Premium  (eventhough Ads won't recorded in Free Subscriptions)                                              |

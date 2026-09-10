@@ -26,8 +26,9 @@ from spytorec.config import load_config, setup_logging, console
 from spytorec.utils import resolve_path, KBHit, LOCK_FILE_PATH
 from spytorec.audio_process import (
     start_audio_process, start_recording, stop_recording,
-    shutdown_audio_process, read_meters, is_audio_alive
+    shutdown_audio_process, read_meters, read_events, is_audio_alive
 )
+from spytorec.boundary import settings_from_config
 from spytorec.recording import (
     get_final_path, finalize, watchdog_worker, BackgroundFinalizer
 )
@@ -255,9 +256,10 @@ def main():
             logging.info(f"Capture gain: '{hw_name}' {change}")
             console.print(f"[yellow]Capture gain corrected: '{hw_name}' {change}[/yellow]")
 
-    start_audio_process(hw_idx, sr, ch, smooth_meter)
+    start_audio_process(hw_idx, sr, ch, smooth_meter, settings_from_config(cfg))
 
     state.set_state(state.STATE_MONITORING)
+    last_poll_done = time.monotonic()
 
     try:
         with Live(Panel(Text("Waiting for Spotify...", style="yellow")), refresh_per_second=10) as live:
@@ -270,6 +272,12 @@ def main():
                         state.peak_l, state.peak_r = meters[2], meters[3]
                         state.raw_l, state.raw_r = meters[4], meters[5]
                         state.last_heartbeat = time.time()
+
+                    # Where the audio process opened each recording
+                    for _, replayed_ms, waited, delay_ms in read_events():
+                        how = "held for the boundary" if waited else "replayed from the buffer"
+                        logging.info(f"Opened recording: {replayed_ms:.0f}ms {how}, "
+                                     f"capture delay now {delay_ms:.0f}ms")
 
                     # Check for error state set by watchdog and recover
                     if state.get_state() == state.STATE_ERROR:
@@ -293,8 +301,12 @@ def main():
                     # File anything the finaliser thread has completed
                     drain_results()
 
-                    # Get playback info from the active track source
+                    # Get playback info from the active track source, dated
+                    poll_started = time.monotonic()
                     playback = source.get_playback()
+                    poll_done = time.monotonic()
+                    poll_gap_ms = (poll_done - last_poll_done) * 1000
+                    last_poll_done = poll_done
 
                     if playback and playback.get('is_playing') and playback.get('item'):
                         track = playback['item']
@@ -347,6 +359,13 @@ def main():
                             # Start new recording
                             bit_depth = cfg['Recording'].get('bit_depth', '24')
 
+                            # How far into the track the source reports it.
+                            # progress_ms measures this; the poll gap bounds it,
+                            # and stands in for sources that step or omit it.
+                            progress_ms = playback.get('progress_ms', 0)
+                            lead_ms = (progress_ms or poll_gap_ms) + \
+                                (time.monotonic() - poll_started) * 1000
+
                             # Named by nanosecond: two recordings can start within a second
                             temp_file = out_dir / f".tmp_{time.time_ns()}.{output_format}"
 
@@ -357,7 +376,7 @@ def main():
                                     logging.warning("MP3 format not yet supported with new pipeline, falling back to FLAC")
 
                                 # Send start command to the audio process
-                                start_recording(temp_file, bit_depth)
+                                start_recording(temp_file, bit_depth, lead_ms)
                                 state.is_recording = True
 
                                 state.watchdog_file_ref = temp_file
@@ -366,7 +385,10 @@ def main():
                                 state.current_track_id_ref = track_id
 
                                 state.set_state(state.STATE_RECORDING)
-                                logging.info(f"Started recording: {track['name']} - {track['artists'][0]['name']}")
+                                logging.info(
+                                    f"Started recording: {track['name']} - {track['artists'][0]['name']} "
+                                    f"(reported {lead_ms:.0f}ms in)"
+                                )
 
                             except Exception as e:
                                 logging.error(f"Failed to start recording: {e}")
@@ -424,7 +446,7 @@ def main():
                     if playback and playback.get('is_playing'):
                         time.sleep(0.5)
                     else:
-                        time.sleep(2.0)
+                        time.sleep(1.0)
 
                     # Keyboard Polling
                     if kb.kbhit():

@@ -31,7 +31,9 @@ DEFAULT_CONFIG = {
         'device_id': '', 'ffmpeg_name': '', 'sample_rate': '48000', 'bit_depth': '24',
         'channels': '2', 'output_format': 'flac', 'output_directory': 'Recordings',
         'auto_start': 'false', 'overwrite_existing': 'false', 'force_safe_mode': 'false',
-        'max_retries': '3', 'retry_delay': '1', 'force_unity_gain': 'true'
+        'max_retries': '3', 'retry_delay': '1', 'preroll_seconds': '5',
+        'capture_delay_ms': '600', 'boundary_window_ms': '800',
+        'force_unity_gain': 'true'
     },
     'QualityDisplay': {
         'show_sample_rate': 'true', 'show_bit_depth': 'true', 'show_channels': 'true',
