@@ -1,5 +1,6 @@
 """Configuration loading, validation, and logging setup."""
 
+import sys
 import logging
 import platform
 import configparser
@@ -10,6 +11,24 @@ from rich.console import Console
 from spytorec.utils import resolve_path, file_lock, CONFIG_FILE_PATH, LOCK_FILE_PATH
 from spytorec.state import SCRIPT_VERSION
 
+
+def _widen_console_encoding() -> None:
+    """
+    Encodes console output as UTF-8, replacing what a stream cannot carry.
+
+    A redirected stream on Windows takes the ANSI code page, which carries no
+    tick, cross or meter block.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or not hasattr(stream, 'reconfigure'):
+            continue
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (OSError, ValueError):
+            pass
+
+
+_widen_console_encoding()
 console = Console()
 
 DEFAULT_CONFIG = {

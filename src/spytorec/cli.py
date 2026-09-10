@@ -29,7 +29,7 @@ from spytorec.audio_process import (
     shutdown_audio_process, read_meters, is_audio_alive
 )
 from spytorec.recording import (
-    get_final_path, finalize, watchdog_worker
+    get_final_path, finalize, watchdog_worker, BackgroundFinalizer
 )
 from spytorec.spotify.selector import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
@@ -195,29 +195,44 @@ def main():
     session_total_bytes = 0
     track_history = deque(maxlen=8)
 
-    def save_current(track, tmp):
-        """Tags and files a finished recording, and records it in the session.
+    def finalize_track(track, tmp):
+        """Tags and files one recording, on the finaliser thread."""
+        result = finalize(tmp, out_dir, track, naming_format, output_format, cfg)
 
-        The one path a completed recording takes, whether the track changed,
-        playback stopped, or SpytoRec is shutting down.
-        """
+        if result['ok'] and cfg['Webhooks'].getboolean('notify_on_track_saved'):
+            send_webhook(
+                f"✅ **Saved:** `{track['artists'][0]['name']} - {track['name']}` "
+                f"({result['size_mb']} MB)", cfg
+            )
+
+        return result
+
+    finalizer = BackgroundFinalizer(finalize_track)
+    finalizer.start()
+
+    def save_current(track, tmp):
+        """Hands a finished recording to the finaliser thread."""
+        finalizer.submit(track, tmp)
+
+    def drain_results():
+        """Applies finished saves to the session tally and history."""
         nonlocal session_tracks_ok, session_total_bytes
 
-        result = finalize(tmp, out_dir, track, naming_format, output_format, cfg)
-        artist = track['artists'][0]['name']
+        for track, result in finalizer.drain():
+            artist = track['artists'][0]['name']
 
-        if result['ok']:
-            session_tracks_ok += 1
-            session_total_bytes += int(result['size_mb'] * 1024 * 1024)
-            track_history.append({'name': track['name'], 'artist': artist, 'size': result['size_mb'], 'status': 'ok'})
-            logging.info(f"Saved: {track['name']}")
-            console.print(f"[green]\u2713 Saved: {track['name']}[/green]")
-            if cfg['Webhooks'].getboolean('notify_on_track_saved'):
-                send_webhook(f"✅ **Saved:** `{artist} - {track['name']}` ({result['size_mb']} MB)", cfg)
-        else:
-            track_history.append({'name': track['name'], 'artist': artist, 'size': 0, 'status': 'fail'})
-            state.failed_recordings.append(track['name'])
-            console.print(f"[red]\u2717 Failed to save: {track['name']}[/red]")
+            if result['ok']:
+                session_tracks_ok += 1
+                session_total_bytes += int(result['size_mb'] * 1024 * 1024)
+                track_history.append({'name': track['name'], 'artist': artist,
+                                      'size': result['size_mb'], 'status': 'ok'})
+                logging.info(f"Saved: {track['name']}")
+                console.print(f"[green]\u2713 Saved: {track['name']}[/green]")
+            else:
+                track_history.append({'name': track['name'], 'artist': artist,
+                                      'size': 0, 'status': 'fail'})
+                state.failed_recordings.append(track['name'])
+                console.print(f"[red]\u2717 Failed to save: {track['name']}[/red]")
 
     # Initialize recording params
     sr = int(cfg['Recording'].get('sample_rate', '48000'))
@@ -267,6 +282,9 @@ def main():
                         time.sleep(2)
                         state.set_state(state.STATE_MONITORING)
                         continue
+
+                    # File anything the finaliser thread has completed
+                    drain_results()
 
                     # Get playback info from the active track source
                     playback = source.get_playback()
@@ -322,8 +340,8 @@ def main():
                             # Start new recording
                             bit_depth = cfg['Recording'].get('bit_depth', '24')
 
-                            # Create temp file
-                            temp_file = out_dir / f".tmp_{int(time.time())}.{output_format}"
+                            # Named by nanosecond: two recordings can start within a second
+                            temp_file = out_dir / f".tmp_{time.time_ns()}.{output_format}"
 
                             try:
                                 if output_format == 'mp3':
@@ -461,11 +479,14 @@ def main():
             time.sleep(0.2)  # Give audio process time to finalize FLAC
         shutdown_audio_process()
         if temp_file and current_track and temp_file.exists():
-            try:
-                save_current(current_track, temp_file)
-            except Exception as e:
-                logging.error(f"Finalise-on-exit failed: {e}")
+            save_current(current_track, temp_file)
             temp_file = None
+
+        # Queued saves finish before the summary counts them
+        if finalizer.busy:
+            console.print("[yellow]Finishing pending saves...[/yellow]")
+        finalizer.close()
+        drain_results()
 
         if ff_log_ptr != subprocess.DEVNULL:
             try:

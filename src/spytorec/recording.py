@@ -1,8 +1,10 @@
 """FFmpeg process control, file finalization, tagging, and watchdog."""
 
 import time
-import subprocess
+import queue
 import logging
+import threading
+import subprocess
 from pathlib import Path
 from typing import Dict
 
@@ -200,3 +202,57 @@ def watchdog_worker(cfg) -> None:
 
         except Exception as e:
             logging.error(f"Watchdog error: {e}")
+
+
+class BackgroundFinalizer:
+    """Finalises recordings on a worker thread; the loop collects the results."""
+
+    def __init__(self, finalize_track):
+        self._finalize_track = finalize_track
+        self._pending = queue.Queue()
+        self._results = queue.Queue()
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._work, daemon=True)
+        self._thread.start()
+
+    def submit(self, track: Dict, temp_file: Path) -> None:
+        """Queues a finished recording. Returns immediately."""
+        self._pending.put((track, temp_file))
+
+    def drain(self):
+        """Yields every (track, result) finished since the last call."""
+        while True:
+            try:
+                yield self._results.get_nowait()
+            except queue.Empty:
+                return
+
+    @property
+    def busy(self) -> bool:
+        return not self._pending.empty()
+
+    def close(self, timeout: float = 60.0) -> None:
+        """Stops the worker once it has finished what it was given."""
+        if self._thread is None:
+            return
+
+        self._pending.put(None)
+        self._thread.join(timeout=timeout)
+        self._thread = None
+
+    def _work(self) -> None:
+        while True:
+            item = self._pending.get()
+            if item is None:
+                return
+
+            track, temp_file = item
+            try:
+                result = self._finalize_track(track, temp_file)
+            except Exception as e:
+                logging.exception(f"Finalise failed for {track.get('name')}: {e}")
+                result = {'ok': False, 'size_mb': 0}
+
+            self._results.put((track, result))
