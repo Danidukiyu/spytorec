@@ -187,6 +187,7 @@ Fork the repo, give it a star, and help build more useful tools for personal mus
 | Contributor | Contribution |
 |---|---|
 | [@electrodics-ship-it](https://github.com/electrodics-ship-it) | V8.1.0 Python Package Architecture — Zero-latency streaming pipes, background watchdog, rich UI, and module refactoring. |
+| [@lucuma13](https://github.com/lucuma13) | Zero-Latency OS Media integration (macOS/Windows) and POSIX non-blocking keyboard IO fixes. |
 
 ---
 
