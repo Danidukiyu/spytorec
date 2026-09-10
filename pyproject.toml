@@ -35,6 +35,7 @@ dependencies = [
     "sounddevice>=0.4.6",
     "numpy>=1.26.0",
     "Pillow>=10.2.0",
+    "winsdk>=1.0.0b10; sys_platform == 'win32'",
 ]
 
 [project.scripts]
