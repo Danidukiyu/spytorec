@@ -139,6 +139,7 @@ spytorec --help
 | No sound recorded           | Verify Spotify is routed to virtual device                         |
 | "Device not found"          | Re-run and use the Interactive Hardware Wizard to select the correct device |
 | Beginning cut off           | Lower `--interval` (e.g. 0.3 or 0.2) in config.ini                 |
+| Recording is far too quiet  | macOS: the system slider attenuates the loopback itself. SpytoRec pins it to unity gain - set `force_unity_gain = false` in config.ini to opt out |
 | Corrupted duration          | Ensure `ffmpeg` finalizer runs successfully                       |
 | Ads in recording            | Use Spotify Premium  (eventhough Ads won't recorded in Free Subscriptions)                                              |
 

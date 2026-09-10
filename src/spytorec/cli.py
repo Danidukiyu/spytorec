@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
 
-from spytorec import state
+from spytorec import state, coreaudio
 from spytorec.config import load_config, setup_logging, console
 from spytorec.utils import resolve_path, KBHit, LOCK_FILE_PATH
 from spytorec.audio_process import (
@@ -248,6 +248,13 @@ def main():
     sr = 44100 if safe_mode else hw_sr
     ch = 2 if safe_mode else hw_ch
     smooth_meter = cfg['UI'].getboolean('smooth_meter_animation', fallback=True)
+
+    # The device's own volume attenuates what the loopback captures
+    if cfg['Recording'].getboolean('force_unity_gain', fallback=True):
+        for change in coreaudio.force_unity_gain(hw_name):
+            logging.info(f"Capture gain: '{hw_name}' {change}")
+            console.print(f"[yellow]Capture gain corrected: '{hw_name}' {change}[/yellow]")
+
     start_audio_process(hw_idx, sr, ch, smooth_meter)
 
     state.set_state(state.STATE_MONITORING)
