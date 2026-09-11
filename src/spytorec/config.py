@@ -13,12 +13,7 @@ from spytorec.state import SCRIPT_VERSION
 
 
 def _widen_console_encoding() -> None:
-    """
-    Encodes console output as UTF-8, replacing what a stream cannot carry.
-
-    A redirected stream on Windows takes the ANSI code page, which carries no
-    tick, cross or meter block.
-    """
+    """Encodes console output as UTF-8, replacing what a stream cannot carry."""
     for stream in (sys.stdout, sys.stderr):
         if stream is None or not hasattr(stream, 'reconfigure'):
             continue
