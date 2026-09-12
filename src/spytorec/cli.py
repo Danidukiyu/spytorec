@@ -255,12 +255,10 @@ def main():
                     # Check for error state set by watchdog and recover
                     if state.get_state() == state.STATE_ERROR:
                         logging.info("Main loop detected error state, attempting recovery...")
-                        with state.ffmpeg_lock:
-                            if state.ffmpeg_process and state.ffmpeg_process.poll() is not None:
-                                state.ffmpeg_process = None
-                            elif state.ffmpeg_process:
-                                safely_stop_ffmpeg(state.ffmpeg_process)
-                                state.ffmpeg_process = None
+                        with state.writer_lock:
+                            if state.active_writer:
+                                state.active_writer.close()
+                                state.active_writer = None
                         if temp_file and temp_file.exists():
                             try:
                                 temp_file.unlink()
@@ -450,10 +448,10 @@ def main():
                                 console.print(f"[yellow]Skipped & blocklisted: {track_name}[/yellow]")
                             except Exception as e:
                                 logging.error(f"Failed to update blocklist: {e}")
-                            with state.ffmpeg_lock:
-                                if state.ffmpeg_process:
-                                    safely_stop_ffmpeg(state.ffmpeg_process)
-                                    state.ffmpeg_process = None
+                            with state.writer_lock:
+                                if state.active_writer:
+                                    state.active_writer.close()
+                                    state.active_writer = None
                             if temp_file and temp_file.exists():
                                 try:
                                     temp_file.unlink()
