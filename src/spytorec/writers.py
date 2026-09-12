@@ -43,7 +43,12 @@ def _flac_writer_process(file_path: str, sr: int, ch: int, subtype: str, q: mp.Q
                 chunk = q.get()
                 if chunk is None:
                     break
-                # Apply 0.95 (-0.44 dB) headroom to prevent WASAPI floats > 1.0 from hard-clipping (crackling)
+                
+                # Sanitize the array: Windows WASAPI occasionally outputs NaN or Inf during loud/complex peaks.
+                # FFmpeg silently erased these, but soundfile (libsndfile) writes them as massive pops/crackles.
+                chunk = np.nan_to_num(chunk, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                # Apply 0.95 (-0.44 dB) headroom to prevent WASAPI floats > 1.0 from hard-clipping
                 safe_chunk = chunk * 0.95
                 f.write(np.clip(safe_chunk, -1.0, 1.0))
     except Exception as e:
