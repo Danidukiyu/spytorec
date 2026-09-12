@@ -49,7 +49,9 @@ class NativeFlacWriter(AudioWriter):
 
     def write(self, chunk: np.ndarray) -> None:
         if self._sf and not self._sf.closed:
-            self._sf.write(chunk)
+            # Clip WASAPI floating point streams to strictly [-1.0, 1.0]
+            # to prevent libsndfile from hard clipping or wrapping around, which causes static.
+            self._sf.write(np.clip(chunk, -1.0, 1.0))
 
     def close(self) -> None:
         if self._sf and not self._sf.closed:

@@ -101,11 +101,13 @@ def audio_writer_worker():
     while True:
         try:
             chunk = state.audio_queue.get()
-            if state.get_state() == state.STATE_RECORDING and state.active_writer:
-                try:
-                    state.active_writer.write(chunk)
-                except Exception as e:
-                    logging.debug(f"Audio writer error: {e}")
+            if state.get_state() == state.STATE_RECORDING:
+                with state.writer_lock:
+                    if state.active_writer:
+                        try:
+                            state.active_writer.write(chunk)
+                        except Exception as e:
+                            logging.debug(f"Audio writer error: {e}")
         except Exception:
             pass
 
