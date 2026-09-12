@@ -33,7 +33,7 @@ class NativeFlacWriter(AudioWriter):
         subtype_map = {
             '16': 'PCM_16',
             '24': 'PCM_24',
-            '32': 'PCM_32'
+            '32': 'PCM_24'  # libsndfile FLAC encoder only supports up to 24-bit
         }
         subtype = subtype_map.get(bit_depth, 'PCM_16')
         

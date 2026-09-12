@@ -346,7 +346,7 @@ def main():
                                             sr=sr, 
                                             ch=min(2, ch), 
                                             ffmpeg_path=args.ffmpeg, 
-                                            log_file=ff_log_path if cfg['Diagnostics'].getboolean('enable_logging') else None
+                                            log_file=ff_log_file if cfg['Diagnostics'].getboolean('enable_logging') else None
                                         )
                                     else:
                                         state.active_writer = NativeFlacWriter(
