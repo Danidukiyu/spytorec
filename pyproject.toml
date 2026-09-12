@@ -35,6 +35,7 @@ dependencies = [
     "soundcard>=0.4.3",
     "numpy>=1.26.0",
     "Pillow>=10.2.0",
+    "soundfile>=0.12.1",
     "winsdk>=1.0.0b10; sys_platform == 'win32'",
 ]
 

@@ -35,7 +35,7 @@ from spytorec.spotify.selector import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
 from spytorec.webhooks import send_webhook
 from spytorec.hardware import discover_hardware
-from spytorec.writers import FFmpegFlacWriter, FFmpegMp3Writer
+from spytorec.writers import NativeFlacWriter, FFmpegMp3Writer
 from spytorec.ui import (
     build_dashboard, build_history_table,
     SP_GREEN, SP_GREEN_DIM, SP_GREY, SP_DARK
@@ -88,6 +88,9 @@ def main():
     cfg = load_config()
     setup_logging(cfg)
     init_audio_config(cfg)
+
+    import multiprocessing
+    multiprocessing.freeze_support()
 
     # Parse arguments
     parser = argparse.ArgumentParser(description=f'SpytoRec v{state.SCRIPT_VERSION} - Spotify Recording Tool')
@@ -349,13 +352,11 @@ def main():
                                             log_file=ff_log_file if cfg['Diagnostics'].getboolean('enable_logging') else None
                                         )
                                     else:
-                                        state.active_writer = FFmpegFlacWriter(
+                                        state.active_writer = NativeFlacWriter(
                                             file_path=temp_file,
                                             sr=sr,
                                             ch=min(2, ch),
-                                            bit_depth=bit_depth,
-                                            ffmpeg_path=args.ffmpeg,
-                                            log_file=ff_log_file if cfg['Diagnostics'].getboolean('enable_logging') else None
+                                            bit_depth=bit_depth
                                         )
 
                                 state.watchdog_proc_ref = state.active_writer

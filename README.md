@@ -20,6 +20,7 @@
 - 🎵 Real-Time Recording (FLAC or OGG/MP3)
 - 🎯 Zero-API Track Monitoring (via OS Media Events)
 - 🔌 Zero-Config Audio Capture (WASAPI Loopback - No Virtual Cables needed!)
+- 🎼 Native FLAC Encoding (`soundfile`) — Zero FFmpeg dependency required for FLAC
 - 🎼 Metadata Embedding: title, artist, album, and cover art
 - ⚙️ Background Finalization for smooth capture
 - 📁 File Organization: Automatically sort by Artist/Album
@@ -38,36 +39,32 @@ SpytoRec v8.1.0+ is now an installable Python package.
 ### 🪟 Windows
 
 1. Install **Python 3.10+** from [python.org](https://www.python.org/downloads/windows/)
-2. Install **FFmpeg**:
-   - Download from [gyan.dev FFmpeg builds](https://www.gyan.dev/ffmpeg/builds/)
-   - Extract it and add the `/bin` folder to your `PATH`
-3. Clone the repo and install the package:
+2. Clone the repo and install the package:
    ```bash
    git clone https://github.com/Danidukiyu/spytorec.git
    cd spytorec
    pip install -e .
    ```
-4. Run the tool (It will automatically detect and record from your default audio output!):
+3. Run the tool (It will automatically detect and record from your default audio output!):
    ```bash
    spytorec
    ```
+
+> [!NOTE]
+> **Optional (MP3 Encoding):** Native recording defaults to FLAC. If you want to save as `.mp3`, you must install **FFmpeg** and add it to your `PATH`.
 
 ---
 
 ### 🍏 macOS
 
 1. Install **Python 3.10+** (via [Homebrew](https://brew.sh/) or [python.org](https://www.python.org/downloads/macos/))
-2. Install **FFmpeg**:
-   ```bash
-   brew install ffmpeg
-   ```
-3. Clone and install the package:
+2. Clone and install the package:
    ```bash
    git clone https://github.com/Danidukiyu/spytorec.git
    cd spytorec
    pip install -e .
    ```
-4. Run the tool:
+3. Run the tool:
    ```bash
    spytorec
    ```
