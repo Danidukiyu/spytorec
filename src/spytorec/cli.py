@@ -35,7 +35,7 @@ from spytorec.spotify.selector import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
 from spytorec.webhooks import send_webhook
 from spytorec.hardware import discover_hardware
-from spytorec.writers import NativeFlacWriter, FFmpegMp3Writer
+from spytorec.writers import FFmpegFlacWriter, FFmpegMp3Writer
 from spytorec.ui import (
     build_dashboard, build_history_table,
     SP_GREEN, SP_GREEN_DIM, SP_GREY, SP_DARK
@@ -349,11 +349,13 @@ def main():
                                             log_file=ff_log_file if cfg['Diagnostics'].getboolean('enable_logging') else None
                                         )
                                     else:
-                                        state.active_writer = NativeFlacWriter(
+                                        state.active_writer = FFmpegFlacWriter(
                                             file_path=temp_file,
                                             sr=sr,
-                                            ch=ch,
-                                            bit_depth=bit_depth
+                                            ch=min(2, ch),
+                                            bit_depth=bit_depth,
+                                            ffmpeg_path=args.ffmpeg,
+                                            log_file=ff_log_file if cfg['Diagnostics'].getboolean('enable_logging') else None
                                         )
 
                                 state.watchdog_proc_ref = state.active_writer

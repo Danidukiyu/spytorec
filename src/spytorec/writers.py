@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import soundfile as sf
 
 
 class AudioWriter(ABC):
@@ -25,37 +24,71 @@ class AudioWriter(ABC):
         """Check if the underlying writer is still alive/valid."""
         return True
 
-class NativeFlacWriter(AudioWriter):
-    """Native Python FLAC writer using soundfile (libsndfile)."""
+class FFmpegFlacWriter(AudioWriter):
+    """FFmpeg writer for FLAC encoding (avoids soundfile popping issues)."""
     
-    def __init__(self, file_path: Path, sr: int, ch: int, bit_depth: str):
-        # Map generic bit depths to soundfile subtypes
-        subtype_map = {
-            '16': 'PCM_16',
-            '24': 'PCM_24',
-            '32': 'PCM_24'  # libsndfile FLAC encoder only supports up to 24-bit
-        }
-        subtype = subtype_map.get(bit_depth, 'PCM_16')
+    def __init__(self, file_path: Path, sr: int, ch: int, bit_depth: str, ffmpeg_path: str, log_file: Optional[Path] = None):
+        fmt_map = {'16': 's16', '24': 's32', '32': 's32'}
+        sample_fmt = fmt_map.get(bit_depth, 's16')
+
+        cmd = [
+            ffmpeg_path, '-y',
+            '-f', 'f32le',
+            '-ar', str(sr),
+            '-ac', str(min(2, ch)),
+            '-i', 'pipe:0',
+            '-sample_fmt', sample_fmt,
+            '-c:a', 'flac', '-compression_level', '8',
+            str(file_path)
+        ]
         
         self.file_path = file_path
-        self._sf = sf.SoundFile(
-            file=str(file_path),
-            mode='w',
-            samplerate=sr,
-            channels=ch,
-            subtype=subtype,
-            format='FLAC'
+        
+        stderr_dest = subprocess.DEVNULL
+        self._log_file_obj = None
+        if log_file:
+            self._log_file_obj = open(log_file, "a")
+            stderr_dest = self._log_file_obj
+
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_dest
         )
 
     def write(self, chunk: np.ndarray) -> None:
-        if self._sf and not self._sf.closed:
-            # Clip WASAPI floating point streams to strictly [-1.0, 1.0]
-            # to prevent libsndfile from hard clipping or wrapping around, which causes static.
-            self._sf.write(np.clip(chunk, -1.0, 1.0))
+        if self._proc and self._proc.stdin:
+            try:
+                # Convert float32 numpy array to raw bytes for FFmpeg stdin
+                self._proc.stdin.write(chunk.astype(np.float32).tobytes())
+            except (BrokenPipeError, OSError) as e:
+                logging.debug(f"FFmpeg FLAC Writer stdin closed: {e}")
 
     def close(self) -> None:
-        if self._sf and not self._sf.closed:
-            self._sf.close()
+        if self._proc:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+                self._proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                logging.warning("FFmpeg FLAC Writer timed out, killing.")
+                self._proc.kill()
+                self._proc.wait()
+            except Exception as e:
+                logging.error(f"Error closing FFmpeg FLAC Writer: {e}")
+            self._proc = None
+
+        if self._log_file_obj:
+            try:
+                self._log_file_obj.close()
+            except Exception:
+                pass
+
+    def is_alive(self) -> bool:
+        if self._proc:
+            return self._proc.poll() is None
+        return False
 
 
 class FFmpegMp3Writer(AudioWriter):
