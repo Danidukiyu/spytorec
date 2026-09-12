@@ -29,12 +29,13 @@ from spytorec.audio import (
     start_writer_thread
 )
 from spytorec.recording import (
-    get_final_path, finalize, safely_stop_ffmpeg, watchdog_worker
+    get_final_path, finalize, watchdog_worker
 )
 from spytorec.spotify.selector import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
 from spytorec.webhooks import send_webhook
 from spytorec.hardware import discover_hardware
+from spytorec.writers import NativeFlacWriter, FFmpegMp3Writer
 from spytorec.ui import (
     build_dashboard, build_history_table,
     SP_GREEN, SP_GREEN_DIM, SP_GREY, SP_DARK
@@ -47,13 +48,13 @@ def cleanup_resources():
     state.stop_event.set()
     stop_monitor_stream()
 
-    with state.ffmpeg_lock:
-        if state.ffmpeg_process and state.ffmpeg_process.poll() is None:
+    with state.writer_lock:
+        if state.active_writer:
             try:
-                safely_stop_ffmpeg(state.ffmpeg_process)
+                state.active_writer.close()
             except Exception:
                 pass
-        state.ffmpeg_process = None
+        state.active_writer = None
 
     for handler in logging.getLogger().handlers:
         try:
@@ -281,12 +282,12 @@ def main():
                         # Handle track change
                         if track_id != current_id:
                             # Stop current recording if any
-                            if state.ffmpeg_process:
+                            if state.active_writer:
                                 state.set_state(state.STATE_SWITCHING)
 
-                                with state.ffmpeg_lock:
-                                    safely_stop_ffmpeg(state.ffmpeg_process)
-                                    state.ffmpeg_process = None
+                                with state.writer_lock:
+                                    state.active_writer.close()
+                                    state.active_writer = None
 
                                 if temp_file and current_track:
                                     save_current(current_track, temp_file)
@@ -337,35 +338,25 @@ def main():
                             # Create temp file
                             temp_file = out_dir / f".tmp_{int(time.time())}.{output_format}"
 
-                            # Build FFmpeg command for piped raw PCM
-                            cmd = [
-                                args.ffmpeg, '-y',
-                                '-f', 'f32le',
-                                '-ar', str(sr),
-                                '-ac', str(min(2, ch)),
-                                '-i', 'pipe:0'
-                            ]
-
-                            if output_format == 'mp3':
-                                cmd.extend(['-c:a', 'libmp3lame', '-b:a', '320k', str(temp_file)])
-                            else:
-                                cmd.extend([
-                                    '-sample_fmt', sample_fmt,
-                                    '-c:a', 'flac', '-compression_level', '8',
-                                    str(temp_file)
-                                ])
-
-                            # Start FFmpeg
                             try:
-                                with state.ffmpeg_lock:
-                                    state.ffmpeg_process = subprocess.Popen(
-                                        cmd,
-                                        stdin=subprocess.PIPE,
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=ff_log_ptr
-                                    )
+                                with state.writer_lock:
+                                    if output_format == 'mp3':
+                                        state.active_writer = FFmpegMp3Writer(
+                                            file_path=temp_file, 
+                                            sr=sr, 
+                                            ch=min(2, ch), 
+                                            ffmpeg_path=args.ffmpeg, 
+                                            log_file=ff_log_path if cfg['Diagnostics'].getboolean('enable_logging') else None
+                                        )
+                                    else:
+                                        state.active_writer = NativeFlacWriter(
+                                            file_path=temp_file,
+                                            sr=sr,
+                                            ch=ch,
+                                            bit_depth=bit_depth
+                                        )
 
-                                state.watchdog_proc_ref = state.ffmpeg_process
+                                state.watchdog_proc_ref = state.active_writer
                                 state.watchdog_file_ref = temp_file
                                 current_track = track
                                 current_id = track_id
@@ -404,12 +395,12 @@ def main():
 
                     else:
                         # Not playing - cleanup if needed
-                        if state.ffmpeg_process:
+                        if state.active_writer:
                             state.set_state(state.STATE_STOPPING)
 
-                            with state.ffmpeg_lock:
-                                safely_stop_ffmpeg(state.ffmpeg_process)
-                                state.ffmpeg_process = None
+                            with state.writer_lock:
+                                state.active_writer.close()
+                                state.active_writer = None
 
                             if temp_file and current_track:
                                 save_current(current_track, temp_file)
@@ -489,10 +480,10 @@ def main():
     finally:
         # Finalise a recording still in progress at shutdown (e.g. 'q' mid-track),
         # otherwise its .tmp file is left untagged and unnamed.
-        with state.ffmpeg_lock:
-            if state.ffmpeg_process:
-                safely_stop_ffmpeg(state.ffmpeg_process)
-                state.ffmpeg_process = None
+        with state.writer_lock:
+            if state.active_writer:
+                state.active_writer.close()
+                state.active_writer = None
         if temp_file and current_track and temp_file.exists():
             try:
                 save_current(current_track, temp_file)

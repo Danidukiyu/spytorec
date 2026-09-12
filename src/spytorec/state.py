@@ -40,7 +40,7 @@ HEARTBEAT_TIMEOUT = 5.0
 # --- Thread-Safe Shared State ---
 state_lock = threading.Lock()
 meter_lock = threading.Lock()
-ffmpeg_lock = threading.Lock()
+writer_lock = threading.Lock()
 
 current_state = STATE_INIT
 last_error_msg = ""
@@ -67,7 +67,7 @@ watchdog_proc_ref = None
 watchdog_file_ref = None
 active_monitor_stream = None
 current_track_id_ref = None
-ffmpeg_process = None
+active_writer = None
 
 
 def set_state(new_state: str, msg: str = "") -> bool:

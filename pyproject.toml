@@ -33,6 +33,7 @@ dependencies = [
     "mutagen>=1.47.0",
     "rich>=13.7.0",
     "soundcard>=0.4.3",
+    "soundfile>=0.12.1",
     "numpy>=1.26.0",
     "Pillow>=10.2.0",
     "winsdk>=1.0.0b10; sys_platform == 'win32'",

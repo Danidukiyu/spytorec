@@ -72,12 +72,12 @@ def _audio_monitor_worker(mic_id: str, sr: int, ch: int):
 
                 # Pipe audio data to the writer queue
                 cur = state.get_state()
-                raw_bytes = np.float32(indata).tobytes()
+                raw_chunk = indata.copy()
                 
                 if cur == state.STATE_RECORDING:
                     # During recording: drop frames only if queue is completely full
                     try:
-                        state.audio_queue.put_nowait(raw_bytes)
+                        state.audio_queue.put_nowait(raw_chunk)
                     except queue.Full:
                         pass
                 elif cur == state.STATE_MONITORING and state.raw_l > 0.001:
@@ -88,7 +88,7 @@ def _audio_monitor_worker(mic_id: str, sr: int, ch: int):
                         except queue.Empty:
                             pass
                     try:
-                        state.audio_queue.put_nowait(raw_bytes)
+                        state.audio_queue.put_nowait(raw_chunk)
                     except queue.Full:
                         pass
 
@@ -97,23 +97,15 @@ def _audio_monitor_worker(mic_id: str, sr: int, ch: int):
 
 
 def audio_writer_worker():
-    """Background thread that writes continuous audio data to FFmpeg stdin."""
-    pipe_broken_logged = False
+    """Background thread that writes continuous audio data to the active AudioWriter."""
     while True:
         try:
             chunk = state.audio_queue.get()
-            if state.get_state() == state.STATE_RECORDING and state.ffmpeg_process and state.ffmpeg_process.stdin:
+            if state.get_state() == state.STATE_RECORDING and state.active_writer:
                 try:
-                    state.ffmpeg_process.stdin.write(chunk)
-                    pipe_broken_logged = False
-                except (BrokenPipeError, OSError):
-                    if not pipe_broken_logged:
-                        logging.debug("FFmpeg stdin pipe closed, waiting for new process")
-                        pipe_broken_logged = True
+                    state.active_writer.write(chunk)
                 except Exception as e:
-                    if not pipe_broken_logged:
-                        logging.debug(f"Audio writer error: {e}")
-                        pipe_broken_logged = True
+                    logging.debug(f"Audio writer error: {e}")
         except Exception:
             pass
 
