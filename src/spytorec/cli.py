@@ -9,9 +9,12 @@ import argparse
 import subprocess
 import threading
 import logging
+import warnings
 from collections import deque
 
-import sounddevice as sd
+warnings.filterwarnings("ignore", module="soundcard")
+
+import soundcard as sc
 from spotipy.exceptions import SpotifyException
 from rich.text import Text
 from rich.panel import Panel
@@ -119,9 +122,9 @@ def main():
 
     if hw_ready:
         try:
-            saved_idx = int(cfg['Recording'].get('device_id'))
-            devices = sd.query_devices()
-            if saved_idx >= len(devices) or devices[saved_idx]['max_input_channels'] == 0:
+            saved_id = cfg['Recording'].get('device_id')
+            mics = sc.all_microphones(include_loopback=True)
+            if not any(m.id == saved_id for m in mics):
                 console.print("[yellow]Previously saved audio device not found. Re-scanning...[/yellow]")
                 hw_ready = False
         except Exception:
@@ -149,7 +152,7 @@ def main():
             hw_name, hw_idx, hw_sr, hw_ch = discover_hardware(args.ffmpeg, cfg)
         else:
             hw_name = cfg['Recording'].get('ffmpeg_name')
-            hw_idx = int(cfg['Recording'].get('device_id'))
+            hw_idx = cfg['Recording'].get('device_id')
             hw_sr = int(cfg['Recording'].get('sample_rate'))
             hw_ch = int(cfg['Recording'].get('channels'))
     else:
@@ -297,7 +300,8 @@ def main():
                             if is_blocked:
                                 console.print(f"[yellow]Skipping Blocked Track: {track['name']} ({block_reason})[/yellow]")
                                 logging.info(f"Skipped track {track['name']}: {block_reason}")
-                                track_history.append({'name': track['name'], 'artist': track['artists'][0]['name'], 'size': 0, 'status': 'skip'})
+                                if not (track_history and track_history[-1]['name'] == track['name'] and track_history[-1]['status'] == 'skip'):
+                                    track_history.append({'name': track['name'], 'artist': track['artists'][0]['name'], 'size': 0, 'status': 'skip'})
                                 state.set_state(state.STATE_SKIPPED)
                                 current_track = track
                                 current_id = track_id

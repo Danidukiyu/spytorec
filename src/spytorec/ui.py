@@ -240,8 +240,8 @@ def build_dashboard(
 
         track_info = Table.grid(expand=True)
         track_info.add_row(Text.from_markup(f"{rec_indicator}  [{SP_WHITE}]{track['name']}[/{SP_WHITE}]"))
-        track_info.add_row(Text(f"Artist: {track['artists'][0]['name']}", style=SP_GREY))
-        track_info.add_row(Text(f"Album:  {track['album']['name']}", style=SP_GREY))
+        track_info.add_row(Text(f"Artist: {track['artists'][0]['name']}", style=SP_GREY, overflow="ellipsis", no_wrap=True))
+        track_info.add_row(Text(f"Album:  {track['album']['name']}", style=SP_GREY, overflow="ellipsis", no_wrap=True))
 
         elapsed_str = format_time_ms(progress)
         total_str = format_time_ms(duration)
@@ -303,7 +303,7 @@ def build_dashboard(
     else:
         idle_grid = Table.grid(expand=True)
         idle_grid.add_row(Text.from_markup(f"[{SP_GREEN}]🎵 Waiting for Spotify...[/{SP_GREEN}]    [dim italic]Listening for audio ♪[/dim italic]"))
-        idle_grid.add_row(Text(f"Device: {hw_name} ({sr}Hz / {bit_depth}-bit / {ch}ch)", style=SP_DARK))
+        idle_grid.add_row(Text(f"Device: {hw_name} ({sr}Hz / {bit_depth}-bit / {ch}ch)", style=SP_DARK, overflow="ellipsis", no_wrap=True))
 
         if state.smoothed_rms_l > 0.0001:
             idle_grid.add_row(Text.from_markup(

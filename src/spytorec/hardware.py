@@ -2,73 +2,68 @@
 
 import os
 import sys
-import re
-import subprocess
 import time
 import logging
+import threading
+import warnings
 from typing import Tuple
 
-import sounddevice as sd
+warnings.filterwarnings("ignore", module="soundcard")
+
+import soundcard as sc
+import numpy as np
 from rich.table import Table
 from rich.panel import Panel
 from rich.live import Live
 
 from spytorec import state
-from spytorec.audio import audio_callback_factory
 from spytorec.config import console
 from spytorec.utils import file_lock, CONFIG_FILE_PATH, LOCK_FILE_PATH, KBHit
 from spytorec.ui import SP_GREEN, SP_GREEN_DIM, SP_GREY
 
 
-def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, int, int, int]:
+def _meter_worker(mic_id: str, mic, stop_event: threading.Event):
+    """Background thread to poll RMS audio levels for the UI wizard."""
+    try:
+        with mic.recorder(samplerate=48000, channels=2) as r:
+            while not stop_event.is_set():
+                data = r.record(numframes=1024)
+                if len(data) > 0:
+                    # data is (frames, channels) of float32
+                    rms = float(np.sqrt(np.mean(data**2)))
+                    with state.meter_lock:
+                        state.meter_data[mic_id] = rms
+                        state.meter_peaks[mic_id] = max(state.meter_peaks.get(mic_id, 0.0), rms)
+    except Exception as e:
+        logging.debug(f"Meter worker error for {mic_id}: {e}")
+
+
+def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, str, int, int]:
     """Interactive hardware wizard with better error handling."""
     state.set_state(state.STATE_IDLE, "Hardware Discovery")
     console.clear()
 
     try:
-        devices = sd.query_devices()
+        mics = sc.all_microphones(include_loopback=True)
     except Exception as e:
         console.print(f"[red]Failed to query audio devices: {e}[/red]")
         sys.exit(1)
 
-    streams = []
-    active_idx = []
-    dshow_names = []
-
-    # Poll FFmpeg for Friendly DShow Names (Windows only)
-    if os.name == 'nt':
-        try:
-            p = subprocess.run(
-                [ffmpeg_path, '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'],
-                capture_output=True, text=True, errors='ignore', timeout=10
-            )
-            dshow_names = re.findall(r'"(.+?)"', p.stderr)
-        except Exception as e:
-            console.print(f"[yellow]Warning: Could not list FFmpeg devices: {e}[/yellow]")
-
-    # Find active devices
-    for i, d in enumerate(devices):
-        if d['max_input_channels'] > 0:
-            try:
-                hostapi = sd.query_hostapis(d['hostapi'])
-                if 'WDM-KS' not in hostapi['name']:
-                    s = sd.InputStream(
-                        device=i,
-                        channels=min(d['max_input_channels'], 2),
-                        samplerate=d['default_samplerate'],
-                        callback=audio_callback_factory(i)
-                    )
-                    s.start()
-                    streams.append(s)
-                    active_idx.append(i)
-                    with state.meter_lock:
-                        state.meter_data[i] = 0.0
-            except Exception:
-                pass
-
-    if not active_idx:
+    if not mics:
         console.print("[red]No suitable input devices found![/red]")
         sys.exit(1)
+
+    stop_event = threading.Event()
+    threads = []
+    
+    # Start metering threads
+    for mic in mics:
+        with state.meter_lock:
+            state.meter_data[mic.id] = 0.0
+            
+        t = threading.Thread(target=_meter_worker, args=(mic.id, mic, stop_event), daemon=True)
+        t.start()
+        threads.append(t)
 
     selected = None
     buf = ""
@@ -84,22 +79,21 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, int, int, int]:
         count = 1
 
         with state.meter_lock:
-            for i in active_idx:
-                sr = int(devices[i]['default_samplerate'])
-                ch = devices[i]['max_input_channels']
-                level = min(40, int(state.meter_data.get(i, 0) * 40))
-
-                has_audio = state.meter_peaks.get(i, 0) > state.AUDIO_THRESHOLD
+            for mic in mics:
+                level = min(40, int(state.meter_data.get(mic.id, 0) * 40))
+                has_audio = state.meter_peaks.get(mic.id, 0) > state.AUDIO_THRESHOLD
                 style = SP_GREEN_DIM if has_audio else "dim"
+                
+                # Highlight if it's a loopback (output device)
+                name_display = f"{mic.name} (Loopback)" if mic.isloopback else mic.name
 
                 t.add_row(
                     f"[{count}]",
-                    f"[{style}]{devices[i]['name']}[/{style}]",
-                    f"[{style}]{sr}Hz | {ch}ch[/{style}]",
+                    f"[{style}]{name_display}[/{style}]",
+                    f"[{style}]48000Hz | 2ch[/{style}]",
                     f"[{SP_GREEN_DIM}]" + "\u2588" * level + f"[/{SP_GREEN_DIM}]" if has_audio else "[dim]" + "\u2501" * 5 + "[/dim]"
                 )
-                rows[count] = dict(devices[i])
-                rows[count]['idx'] = i
+                rows[count] = mic
                 count += 1
 
         return Panel(t, subtitle=f"[{SP_GREY}]Selection: {buf}[/{SP_GREY}]", border_style=SP_GREEN_DIM), rows
@@ -107,7 +101,6 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, int, int, int]:
     console.print("[yellow]Press a number key to pick a device (Enter to confirm a multi-digit number)[/yellow]")
 
     def apply_key(c):
-        """Feed one character into the selection buffer. Returns a chosen row or None."""
         nonlocal buf
         if c in ('\r', '\n'):
             if buf.isdigit() and int(buf) in rows:
@@ -117,8 +110,6 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, int, int, int]:
             buf = buf[:-1]
         elif c.isdigit():
             buf += c
-            # Auto-confirm as soon as the buffer is an unambiguous complete match
-            # (i.e. no longer device number starts with these digits).
             if int(buf) in rows and not any(
                 str(k).startswith(buf) and len(str(k)) > len(buf) for k in rows
             ):
@@ -147,27 +138,15 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, int, int, int]:
     finally:
         kb.set_normal_term()
 
-    # Cleanup streams
-    for s in streams:
-        try:
-            s.stop()
-            s.close()
-        except Exception:
-            pass
-
-    # Find best FFmpeg name match (Windows DShow only)
-    best_name = selected['name']
-    if os.name == 'nt':
-        for dshow_name in dshow_names:
-            if selected['name'][:15] in dshow_name:
-                best_name = dshow_name
-                break
+    stop_event.set()
 
     # Save to config
-    cfg.set('Recording', 'ffmpeg_name', best_name)
-    cfg.set('Recording', 'device_id', str(selected['idx']))
-    cfg.set('Recording', 'sample_rate', str(int(selected['default_samplerate'])))
-    cfg.set('Recording', 'channels', str(min(2, selected['max_input_channels'])))
+    cfg.set('Recording', 'ffmpeg_name', selected.name)
+    cfg.set('Recording', 'device_id', str(selected.id))
+    # Soundcard generally works best internally if we just request standard rates,
+    # it auto-resamples if needed.
+    cfg.set('Recording', 'sample_rate', '48000')
+    cfg.set('Recording', 'channels', '2')
 
     try:
         with file_lock(LOCK_FILE_PATH):
@@ -176,4 +155,4 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, int, int, int]:
     except Exception as e:
         console.print(f"[yellow]Could not save config: {e}[/yellow]")
 
-    return best_name, selected['idx'], int(selected['default_samplerate']), min(2, selected['max_input_channels'])
+    return selected.name, selected.id, 48000, 2
