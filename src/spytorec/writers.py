@@ -43,14 +43,10 @@ def _flac_writer_process(file_path: str, sr: int, ch: int, subtype: str, q: mp.Q
                 chunk = q.get()
                 if chunk is None:
                     break
-                
-                # Sanitize the array: Windows WASAPI occasionally outputs NaN or Inf during loud/complex peaks.
-                # FFmpeg silently erased these, but soundfile (libsndfile) writes them as massive pops/crackles.
-                chunk = np.nan_to_num(chunk, nan=0.0, posinf=1.0, neginf=-1.0)
-                
-                # Apply 0.95 (-0.44 dB) headroom to prevent WASAPI floats > 1.0 from hard-clipping
-                safe_chunk = chunk * 0.95
-                f.write(np.clip(safe_chunk, -1.0, 1.0))
+                # Clip to [-1.0, 1.0] as a safety net for FLAC encoding.
+                # Diagnostic confirmed raw WASAPI data is clean (no NaN/Inf, max ~0.93),
+                # so this is purely a safeguard, not the fix for popping.
+                f.write(np.clip(chunk, -1.0, 1.0))
     except Exception as e:
         print(f"NativeFlacWriter process error: {e}")
         traceback.print_exc()
@@ -79,9 +75,11 @@ class NativeFlacWriter(AudioWriter):
     def write(self, chunk: np.ndarray) -> None:
         if self._proc and self._proc.is_alive():
             try:
-                self._queue.put_nowait(chunk)
+                # Use blocking put to prevent frame drops. The child process should
+                # always keep up with real-time encoding, so this rarely blocks.
+                self._queue.put(chunk, timeout=1.0)
             except queue.Full:
-                logging.warning("NativeFlacWriter IPC queue is full, dropping chunk!")
+                logging.warning("NativeFlacWriter IPC queue is full for 1s — dropping chunk!")
 
     def close(self) -> None:
         if self._proc:

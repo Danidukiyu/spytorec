@@ -75,39 +75,35 @@ def _audio_monitor_worker(mic_id: str, sr: int, ch: int):
                 raw_chunk = indata.copy()
                 
                 if cur == state.STATE_RECORDING:
-                    # During recording: drop frames only if queue is completely full
+                    # During recording: BLOCK if queue is full rather than dropping frames.
+                    # A dropped frame = an audible pop in the output file.
                     try:
-                        state.audio_queue.put_nowait(raw_chunk)
+                        state.audio_queue.put(raw_chunk, timeout=0.5)
                     except queue.Full:
-                        pass
-                elif cur == state.STATE_MONITORING and state.raw_l > 0.001:
-                    # Pre-roll buffer: keep a rolling window so we capture the first beat
-                    if state.audio_queue.full():
-                        try:
-                            state.audio_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                    try:
-                        state.audio_queue.put_nowait(raw_chunk)
-                    except queue.Full:
-                        pass
+                        logging.warning("Audio queue full for 500ms during recording — dropping frame!")
 
     except Exception as e:
         logging.error(f"Monitor worker error: {e}")
 
 
 def audio_writer_worker():
-    """Background thread that writes continuous audio data to the active AudioWriter."""
+    """Background thread that writes continuous audio data to the active AudioWriter.
+    
+    IMPORTANT: Do NOT gate writes on application state. The active_writer being
+    set to None is the authoritative signal to stop writing. Checking state here
+    introduces a TOCTOU race condition where chunks are consumed from the queue
+    but silently discarded during brief state transitions (e.g. SWITCHING),
+    which creates audible pops/clicks in the output file.
+    """
     while True:
         try:
             chunk = state.audio_queue.get()
-            if state.get_state() == state.STATE_RECORDING:
-                with state.writer_lock:
-                    if state.active_writer:
-                        try:
-                            state.active_writer.write(chunk)
-                        except Exception as e:
-                            logging.debug(f"Audio writer error: {e}")
+            with state.writer_lock:
+                if state.active_writer:
+                    try:
+                        state.active_writer.write(chunk)
+                    except Exception as e:
+                        logging.debug(f"Audio writer error: {e}")
         except Exception:
             pass
 
