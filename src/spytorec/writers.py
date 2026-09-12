@@ -43,7 +43,9 @@ def _flac_writer_process(file_path: str, sr: int, ch: int, subtype: str, q: mp.Q
                 chunk = q.get()
                 if chunk is None:
                     break
-                f.write(np.clip(chunk, -1.0, 1.0))
+                # Apply 0.95 (-0.44 dB) headroom to prevent WASAPI floats > 1.0 from hard-clipping (crackling)
+                safe_chunk = chunk * 0.95
+                f.write(np.clip(safe_chunk, -1.0, 1.0))
     except Exception as e:
         print(f"NativeFlacWriter process error: {e}")
         traceback.print_exc()
@@ -60,7 +62,8 @@ class NativeFlacWriter(AudioWriter):
         subtype = subtype_map.get(bit_depth, 'PCM_16')
         
         self.file_path = file_path
-        self._queue = mp.Queue(maxsize=100)
+        # Increase queue size to 500 (approx 42 seconds of buffer) to prevent any dropped frames
+        self._queue = mp.Queue(maxsize=500)
         self._proc = mp.Process(
             target=_flac_writer_process,
             args=(str(file_path), sr, ch, subtype, self._queue),
