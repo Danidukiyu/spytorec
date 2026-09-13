@@ -324,9 +324,11 @@ def build_dashboard(
     # Debug overlay
     if cfg['Debug'].getboolean('show_debug_overlay'):
         dashboard.add_section()
-        has_writer = "Yes" if state.active_writer else "No"
+        from spytorec.audio_process import is_audio_alive
+        audio_status = "Alive" if is_audio_alive() else "Dead"
+        recording = "Yes" if state.is_recording else "No"
         dashboard.add_row(Text.from_markup(
-            f"[dim]Writer: {has_writer} | State: {cur_state} | L={state.raw_l:.3f} R={state.raw_r:.3f} | Mono frames: {state.mono_warning_frames}[/dim]"
+            f"[dim]Recording: {recording} | Audio: {audio_status} | State: {cur_state} | L={state.raw_l:.3f} R={state.raw_r:.3f} | Mono frames: {state.mono_warning_frames}[/dim]"
         ))
 
     dashboard.add_section()

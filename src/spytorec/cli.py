@@ -24,9 +24,9 @@ from rich.live import Live
 from spytorec import state
 from spytorec.config import load_config, setup_logging, console
 from spytorec.utils import resolve_path, KBHit, LOCK_FILE_PATH
-from spytorec.audio import (
-    init_audio_config, start_monitor, stop_monitor_stream,
-    start_writer_thread
+from spytorec.audio_process import (
+    start_audio_process, start_recording, stop_recording,
+    shutdown_audio_process, read_meters, is_audio_alive
 )
 from spytorec.recording import (
     get_final_path, finalize, watchdog_worker
@@ -35,7 +35,7 @@ from spytorec.spotify.selector import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
 from spytorec.webhooks import send_webhook
 from spytorec.hardware import discover_hardware
-from spytorec.writers import NativeFlacWriter, FFmpegMp3Writer
+from spytorec.writers import FFmpegMp3Writer
 from spytorec.ui import (
     build_dashboard, build_history_table,
     SP_GREEN, SP_GREEN_DIM, SP_GREY, SP_DARK
@@ -46,15 +46,7 @@ def cleanup_resources():
     """Clean up all resources before exit."""
     logging.info("Cleaning up resources...")
     state.stop_event.set()
-    stop_monitor_stream()
-
-    with state.writer_lock:
-        if state.active_writer:
-            try:
-                state.active_writer.close()
-            except Exception:
-                pass
-        state.active_writer = None
+    shutdown_audio_process()
 
     for handler in logging.getLogger().handlers:
         try:
@@ -87,7 +79,6 @@ def main():
     # Load configuration
     cfg = load_config()
     setup_logging(cfg)
-    init_audio_config(cfg)
 
     import multiprocessing
     multiprocessing.freeze_support()
@@ -237,14 +228,12 @@ def main():
     kb = KBHit()
     kb.set_cbreak()
 
-    # Start audio writer background thread
-    start_writer_thread()
-
-    # Start continuous audio monitor once at startup
+    # Start process-isolated audio pipeline
     safe_mode = cfg['Recording'].getboolean('force_safe_mode')
     sr = 44100 if safe_mode else hw_sr
     ch = 2 if safe_mode else hw_ch
-    start_monitor(hw_idx, sr, ch, cfg)
+    smooth_meter = cfg['UI'].getboolean('smooth_meter_animation', fallback=True)
+    start_audio_process(hw_idx, sr, ch, smooth_meter)
 
     state.set_state(state.STATE_MONITORING)
 
@@ -252,13 +241,19 @@ def main():
         with Live(Panel(Text("Waiting for Spotify...", style="yellow")), refresh_per_second=10) as live:
             while not state.stop_event.is_set():
                 try:
+                    # Update metering from audio process
+                    meters = read_meters()
+                    if meters:
+                        state.smoothed_rms_l, state.smoothed_rms_r = meters[0], meters[1]
+                        state.peak_l, state.peak_r = meters[2], meters[3]
+                        state.raw_l, state.raw_r = meters[4], meters[5]
+                        state.last_heartbeat = time.time()
+
                     # Check for error state set by watchdog and recover
                     if state.get_state() == state.STATE_ERROR:
                         logging.info("Main loop detected error state, attempting recovery...")
-                        with state.writer_lock:
-                            if state.active_writer:
-                                state.active_writer.close()
-                                state.active_writer = None
+                        stop_recording()
+                        state.is_recording = False
                         if temp_file and temp_file.exists():
                             try:
                                 temp_file.unlink()
@@ -283,12 +278,13 @@ def main():
                         # Handle track change
                         if track_id != current_id:
                             # Stop current recording if any
-                            if state.active_writer:
+                            if state.is_recording:
                                 state.set_state(state.STATE_SWITCHING)
+                                stop_recording()
+                                state.is_recording = False
 
-                                with state.writer_lock:
-                                    state.active_writer.close()
-                                    state.active_writer = None
+                                # Give the audio process a moment to finalize the FLAC
+                                time.sleep(0.1)
 
                                 if temp_file and current_track:
                                     save_current(current_track, temp_file)
@@ -324,40 +320,21 @@ def main():
                                 continue
 
                             # Start new recording
-                            safe_mode = cfg['Recording'].getboolean('force_safe_mode')
-                            sr = 44100 if safe_mode else hw_sr
-                            ch = 2 if safe_mode else hw_ch
                             bit_depth = cfg['Recording'].get('bit_depth', '24')
-
-                            fmt_map = {'16': 's16', '24': 's32', '32': 's32'}
-                            sample_fmt = fmt_map.get(bit_depth, 's16')
-
-                            # Clear old audio chunks
-                            with state.audio_queue.mutex:
-                                state.audio_queue.queue.clear()
 
                             # Create temp file
                             temp_file = out_dir / f".tmp_{int(time.time())}.{output_format}"
 
                             try:
-                                with state.writer_lock:
-                                    if output_format == 'mp3':
-                                        state.active_writer = FFmpegMp3Writer(
-                                            file_path=temp_file, 
-                                            sr=sr, 
-                                            ch=min(2, ch), 
-                                            ffmpeg_path=args.ffmpeg, 
-                                            log_file=ff_log_file if cfg['Diagnostics'].getboolean('enable_logging') else None
-                                        )
-                                    else:
-                                        state.active_writer = NativeFlacWriter(
-                                            file_path=temp_file,
-                                            sr=sr,
-                                            ch=min(2, ch),
-                                            bit_depth=bit_depth
-                                        )
+                                if output_format == 'mp3':
+                                    # MP3 still uses FFmpeg (no native encoder)
+                                    # TODO: Route MP3 through audio_process or keep FFmpeg fallback
+                                    logging.warning("MP3 format not yet supported with new pipeline, falling back to FLAC")
 
-                                state.watchdog_proc_ref = state.active_writer
+                                # Send start command to the audio process
+                                start_recording(temp_file, bit_depth)
+                                state.is_recording = True
+
                                 state.watchdog_file_ref = temp_file
                                 current_track = track
                                 current_id = track_id
@@ -367,14 +344,14 @@ def main():
                                 logging.info(f"Started recording: {track['name']} - {track['artists'][0]['name']}")
 
                             except Exception as e:
-                                logging.error(f"Failed to start FFmpeg: {e}")
+                                logging.error(f"Failed to start recording: {e}")
                                 if temp_file and temp_file.exists():
                                     try:
                                         temp_file.unlink()
                                     except Exception:
                                         pass
                                 temp_file = None
-                                state.set_state(state.STATE_ERROR, f"FFmpeg error: {e}")
+                                state.set_state(state.STATE_ERROR, f"Recording error: {e}")
                                 continue
 
                         # Build UI display
@@ -396,12 +373,11 @@ def main():
 
                     else:
                         # Not playing - cleanup if needed
-                        if state.active_writer:
+                        if state.is_recording:
                             state.set_state(state.STATE_STOPPING)
-
-                            with state.writer_lock:
-                                state.active_writer.close()
-                                state.active_writer = None
+                            stop_recording()
+                            state.is_recording = False
+                            time.sleep(0.1)
 
                             if temp_file and current_track:
                                 save_current(current_track, temp_file)
@@ -448,10 +424,8 @@ def main():
                                 console.print(f"[yellow]Skipped & blocklisted: {track_name}[/yellow]")
                             except Exception as e:
                                 logging.error(f"Failed to update blocklist: {e}")
-                            with state.writer_lock:
-                                if state.active_writer:
-                                    state.active_writer.close()
-                                    state.active_writer = None
+                            stop_recording()
+                            state.is_recording = False
                             if temp_file and temp_file.exists():
                                 try:
                                     temp_file.unlink()
@@ -481,10 +455,11 @@ def main():
     finally:
         # Finalise a recording still in progress at shutdown (e.g. 'q' mid-track),
         # otherwise its .tmp file is left untagged and unnamed.
-        with state.writer_lock:
-            if state.active_writer:
-                state.active_writer.close()
-                state.active_writer = None
+        if state.is_recording:
+            stop_recording()
+            state.is_recording = False
+            time.sleep(0.2)  # Give audio process time to finalize FLAC
+        shutdown_audio_process()
         if temp_file and current_track and temp_file.exists():
             try:
                 save_current(current_track, temp_file)

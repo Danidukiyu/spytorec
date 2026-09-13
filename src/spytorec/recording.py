@@ -175,11 +175,12 @@ def watchdog_worker(cfg) -> None:
                 else:
                     no_heartbeat_count = 0
 
-            # Check active writer
-            with state.writer_lock:
-                if state.active_writer and not getattr(state.active_writer, 'is_alive', lambda: True)():
-                    logging.error("Audio writer terminated unexpectedly")
-                    state.set_state(state.STATE_ERROR, "Writer terminated unexpectedly")
+            # Check audio process is alive
+            if current_state_val == state.STATE_RECORDING:
+                from spytorec.audio_process import is_audio_alive
+                if not is_audio_alive():
+                    logging.error("Audio process terminated unexpectedly")
+                    state.set_state(state.STATE_ERROR, "Audio process terminated unexpectedly")
 
             # Check file growth
             if current_state_val == state.STATE_RECORDING and state.watchdog_file_ref and state.watchdog_file_ref.exists():
