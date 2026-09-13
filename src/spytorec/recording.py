@@ -147,49 +147,7 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
         return {'ok': False}
 
 
-def safely_stop_ffmpeg(proc) -> None:
-    """Shutdown protocol for FFmpeg with proper stdin pipe closure.
-    Closes stdin first to signal EOF, letting FFmpeg flush its output buffer
-    and finalize the file header. Then terminates if it doesn't exit on its own.
-    """
-    if not proc or proc.poll() is not None:
-        return
-
-    try:
-        # Step 1: Close stdin pipe to signal EOF to FFmpeg.
-        if proc.stdin:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-
-        # Step 2: Wait for FFmpeg to exit gracefully after receiving EOF.
-        try:
-            proc.wait(timeout=5)
-            logging.info("FFmpeg stopped gracefully via stdin EOF")
-            return
-        except subprocess.TimeoutExpired:
-            pass
-
-        # Step 3: FFmpeg didn't exit after EOF, send SIGTERM.
-        logging.warning("FFmpeg didn't exit after stdin close, sending SIGTERM...")
-        proc.terminate()
-
-        try:
-            proc.wait(timeout=5)
-            logging.info("FFmpeg stopped after SIGTERM")
-        except subprocess.TimeoutExpired:
-            logging.warning("FFmpeg didn't respond to SIGTERM, killing...")
-            proc.kill()
-            proc.wait()
-            logging.warning("FFmpeg killed")
-
-    except Exception as e:
-        logging.error(f"Error stopping FFmpeg: {e}")
-        try:
-            proc.kill()
-        except Exception:
-            pass
+# safely_stop_ffmpeg removed, handled by writers.py
 
 
 def watchdog_worker(cfg) -> None:
@@ -217,12 +175,12 @@ def watchdog_worker(cfg) -> None:
                 else:
                     no_heartbeat_count = 0
 
-            # Check FFmpeg process
-            with state.ffmpeg_lock:
-                if state.ffmpeg_process and state.ffmpeg_process.poll() is not None:
-                    returncode = state.ffmpeg_process.poll()
-                    logging.error(f"FFmpeg terminated with code {returncode}")
-                    state.set_state(state.STATE_ERROR, f"FFmpeg terminated (code {returncode})")
+            # Check audio process is alive
+            if current_state_val == state.STATE_RECORDING:
+                from spytorec.audio_process import is_audio_alive
+                if not is_audio_alive():
+                    logging.error("Audio process terminated unexpectedly")
+                    state.set_state(state.STATE_ERROR, "Audio process terminated unexpectedly")
 
             # Check file growth
             if current_state_val == state.STATE_RECORDING and state.watchdog_file_ref and state.watchdog_file_ref.exists():

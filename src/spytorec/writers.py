@@ -1,0 +1,95 @@
+"""Audio writer abstractions.
+
+FLAC encoding is now handled by audio_process.py (process-isolated pipeline).
+This module only retains FFmpegMp3Writer for the MP3 fallback path.
+"""
+
+import logging
+import subprocess
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+
+class AudioWriter(ABC):
+    """Abstract base class for audio writers."""
+    
+    @abstractmethod
+    def write(self, chunk: np.ndarray) -> None:
+        """Write a chunk of audio data (shape: frames, channels)."""
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Finalize and close the writer safely."""
+        pass
+
+    def is_alive(self) -> bool:
+        """Check if the underlying writer is still alive/valid."""
+        return True
+
+
+class FFmpegMp3Writer(AudioWriter):
+    """Fallback FFmpeg writer for MP3 encoding."""
+    
+    def __init__(self, file_path: Path, sr: int, ch: int, ffmpeg_path: str, log_file: Optional[Path] = None):
+        cmd = [
+            ffmpeg_path, '-y',
+            '-f', 'f32le',
+            '-ar', str(sr),
+            '-ac', str(min(2, ch)),
+            '-i', 'pipe:0',
+            '-c:a', 'libmp3lame', 
+            '-b:a', '320k',
+            str(file_path)
+        ]
+        
+        self.file_path = file_path
+        
+        stderr_dest = subprocess.DEVNULL
+        self._log_file_obj = None
+        if log_file:
+            self._log_file_obj = open(log_file, "a")
+            stderr_dest = self._log_file_obj
+
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_dest
+        )
+
+    def write(self, chunk: np.ndarray) -> None:
+        if self._proc and self._proc.stdin:
+            try:
+                # Convert float32 numpy array to raw bytes for FFmpeg stdin
+                self._proc.stdin.write(chunk.astype(np.float32).tobytes())
+            except (BrokenPipeError, OSError) as e:
+                logging.debug(f"FFmpeg MP3 Writer stdin closed: {e}")
+
+    def close(self) -> None:
+        if self._proc:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+                self._proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                logging.warning("FFmpeg MP3 Writer timed out, killing.")
+                self._proc.kill()
+                self._proc.wait()
+            except Exception as e:
+                logging.error(f"Error closing FFmpeg MP3 Writer: {e}")
+            self._proc = None
+
+        if self._log_file_obj:
+            try:
+                self._log_file_obj.close()
+            except Exception:
+                pass
+
+    def is_alive(self) -> bool:
+        if self._proc:
+            return self._proc.poll() is None
+        return False

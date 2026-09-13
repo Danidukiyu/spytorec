@@ -239,9 +239,12 @@ def build_dashboard(
             rec_indicator = "[yellow]WAIT[/yellow]"
 
         track_info = Table.grid(expand=True)
-        track_info.add_row(Text.from_markup(f"{rec_indicator}  [{SP_WHITE}]{track['name']}[/{SP_WHITE}]"))
-        track_info.add_row(Text(f"Artist: {track['artists'][0]['name']}", style=SP_GREY))
-        track_info.add_row(Text(f"Album:  {track['album']['name']}", style=SP_GREY))
+        track_title = Text.from_markup(f"{rec_indicator}  [{SP_WHITE}]{track['name']}[/{SP_WHITE}]")
+        track_title.no_wrap = True
+        track_title.overflow = "ellipsis"
+        track_info.add_row(track_title)
+        track_info.add_row(Text(f"Artist: {track['artists'][0]['name']}", style=SP_GREY, overflow="ellipsis", no_wrap=True))
+        track_info.add_row(Text(f"Album:  {track['album']['name']}", style=SP_GREY, overflow="ellipsis", no_wrap=True))
 
         elapsed_str = format_time_ms(progress)
         total_str = format_time_ms(duration)
@@ -302,8 +305,11 @@ def build_dashboard(
 
     else:
         idle_grid = Table.grid(expand=True)
-        idle_grid.add_row(Text.from_markup(f"[{SP_GREEN}]🎵 Waiting for Spotify...[/{SP_GREEN}]    [dim italic]Listening for audio ♪[/dim italic]"))
-        idle_grid.add_row(Text(f"Device: {hw_name} ({sr}Hz / {bit_depth}-bit / {ch}ch)", style=SP_DARK))
+        idle_title = Text.from_markup(f"[{SP_GREEN}]🎵 Waiting for Spotify...[/{SP_GREEN}]    [dim italic]Listening for audio ♪[/dim italic]")
+        idle_title.no_wrap = True
+        idle_title.overflow = "ellipsis"
+        idle_grid.add_row(idle_title)
+        idle_grid.add_row(Text(f"Device: {hw_name} ({sr}Hz / {bit_depth}-bit / {ch}ch)", style=SP_DARK, overflow="ellipsis", no_wrap=True))
 
         if state.smoothed_rms_l > 0.0001:
             idle_grid.add_row(Text.from_markup(
@@ -318,9 +324,11 @@ def build_dashboard(
     # Debug overlay
     if cfg['Debug'].getboolean('show_debug_overlay'):
         dashboard.add_section()
-        pid = state.ffmpeg_process.pid if state.ffmpeg_process else 'None'
+        from spytorec.audio_process import is_audio_alive
+        audio_status = "Alive" if is_audio_alive() else "Dead"
+        recording = "Yes" if state.is_recording else "No"
         dashboard.add_row(Text.from_markup(
-            f"[dim]PID: {pid} | State: {cur_state} | L={state.raw_l:.3f} R={state.raw_r:.3f} | Mono frames: {state.mono_warning_frames}[/dim]"
+            f"[dim]Recording: {recording} | Audio: {audio_status} | State: {cur_state} | L={state.raw_l:.3f} R={state.raw_r:.3f} | Mono frames: {state.mono_warning_frames}[/dim]"
         ))
 
     dashboard.add_section()
@@ -335,7 +343,10 @@ def build_dashboard(
     except Exception:
         disk_str = ""
     stats_line = f"📊 {session_tracks_ok} tracks | {total_mb} MB | {elapsed_str}{disk_str}"
-    dashboard.add_row(Text.from_markup(f"[{SP_DARK}]{stats_line}[/{SP_DARK}]"))
+    stats_text = Text.from_markup(f"[{SP_DARK}]{stats_line}[/{SP_DARK}]")
+    stats_text.no_wrap = True
+    stats_text.overflow = "ellipsis"
+    dashboard.add_row(stats_text)
 
     # Track history
     history_panel = build_history_table(track_history)
@@ -349,8 +360,11 @@ def build_dashboard(
     if cfg['Diagnostics'].getboolean('enable_logging'):
         logs = get_tail_logs(cfg, 3)
         if logs:
+            log_text = Text.from_markup(f"[dim]{logs}[/dim]")
+            log_text.no_wrap = True
+            log_text.overflow = "ellipsis"
             dashboard.add_row(Panel(
-                Text.from_markup(f"[dim]{logs}[/dim]"),
+                log_text,
                 title=f"[{SP_DARK}]System Log[/{SP_DARK}]",
                 border_style=SP_DARK
             ))

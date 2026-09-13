@@ -4,15 +4,19 @@ import time
 import queue
 import logging
 import threading
+import warnings
+
+warnings.filterwarnings("ignore", module="soundcard")
 
 import numpy as np
-import sounddevice as sd
+import soundcard as sc
 
 from spytorec import state
 
 
 # Cached config value for the hot path (set during init)
 _smooth_meter = True
+_monitor_stop_event = threading.Event()
 
 
 def init_audio_config(cfg):
@@ -21,122 +25,119 @@ def init_audio_config(cfg):
     _smooth_meter = cfg['UI'].getboolean('smooth_meter_animation')
 
 
-def live_monitor_callback(indata, frames, time_info, status) -> None:
-    """Dual-purpose callback: Powers UI meters and pipes audio to FFmpeg."""
+def _audio_monitor_worker(mic_id: str, sr: int, ch: int):
+    """Dedicated thread that polls soundcard for audio frames, meters them, and queues them."""
     try:
-        state.last_heartbeat = time.time()
+        mics = sc.all_microphones(include_loopback=True)
+        mic = next((m for m in mics if m.id == mic_id), None)
+        if not mic:
+            logging.error(f"Could not find device id: {mic_id}")
+            state.set_state(state.STATE_ERROR, "Audio device not found")
+            return
 
-        if indata.shape[1] >= 2:
-            state.raw_l = float(np.sqrt(np.mean(indata[:, 0]**2)))
-            state.raw_r = float(np.sqrt(np.mean(indata[:, 1]**2)))
-        else:
-            state.raw_l = state.raw_r = float(np.sqrt(np.mean(indata[:, 0]**2)))
-
-        alpha = 0.4 if _smooth_meter else 1.0
-        state.smoothed_rms_l = (alpha * state.raw_l) + ((1 - alpha) * state.smoothed_rms_l)
-        state.smoothed_rms_r = (alpha * state.raw_r) + ((1 - alpha) * state.smoothed_rms_r)
-
-        state.peak_l = max(state.raw_l, state.peak_l * 0.99)
-        state.peak_r = max(state.raw_r, state.peak_r * 0.99)
-
-        if state.raw_l > 0.01 and abs(state.raw_l - state.raw_r) < 0.0001:
-            state.mono_warning_frames += 1
-        else:
-            state.mono_warning_frames = max(0, state.mono_warning_frames - 2)
-
-        # Pipe audio data to the writer queue
-        cur = state.get_state()
-        if cur == state.STATE_RECORDING:
-            # During recording: drop frames only if queue is completely full
-            try:
-                state.audio_queue.put_nowait(indata.tobytes())
-            except queue.Full:
-                pass
-        elif cur == state.STATE_MONITORING and state.raw_l > 0.001:
-            # Pre-roll buffer: keep a rolling window so we capture the first beat
-            if state.audio_queue.full():
+        with mic.recorder(samplerate=sr, channels=min(2, ch)) as recorder:
+            logging.info(f"Monitor started on device {mic.name} at {sr}Hz")
+            
+            while not _monitor_stop_event.is_set():
                 try:
-                    state.audio_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            try:
-                state.audio_queue.put_nowait(indata.tobytes())
-            except queue.Full:
-                pass
+                    indata = recorder.record(numframes=1024)
+                except Exception as e:
+                    logging.debug(f"Record error: {e}")
+                    time.sleep(0.01)
+                    continue
+                    
+                if len(indata) == 0:
+                    time.sleep(0.01)
+                    continue
+
+                state.last_heartbeat = time.time()
+
+                if indata.shape[1] >= 2:
+                    state.raw_l = float(np.sqrt(np.mean(indata[:, 0]**2)))
+                    state.raw_r = float(np.sqrt(np.mean(indata[:, 1]**2)))
+                else:
+                    state.raw_l = state.raw_r = float(np.sqrt(np.mean(indata[:, 0]**2)))
+
+                alpha = 0.4 if _smooth_meter else 1.0
+                state.smoothed_rms_l = (alpha * state.raw_l) + ((1 - alpha) * state.smoothed_rms_l)
+                state.smoothed_rms_r = (alpha * state.raw_r) + ((1 - alpha) * state.smoothed_rms_r)
+
+                state.peak_l = max(state.raw_l, state.peak_l * 0.99)
+                state.peak_r = max(state.raw_r, state.peak_r * 0.99)
+
+                if state.raw_l > 0.01 and abs(state.raw_l - state.raw_r) < 0.0001:
+                    state.mono_warning_frames += 1
+                else:
+                    state.mono_warning_frames = max(0, state.mono_warning_frames - 2)
+
+                # Pipe audio data to the writer queue
+                cur = state.get_state()
+                raw_chunk = indata.copy()
+                
+                if cur == state.STATE_RECORDING:
+                    # During recording: BLOCK if queue is full rather than dropping frames.
+                    # A dropped frame = an audible pop in the output file.
+                    try:
+                        state.audio_queue.put(raw_chunk, timeout=0.5)
+                    except queue.Full:
+                        logging.warning("Audio queue full for 500ms during recording — dropping frame!")
 
     except Exception as e:
-        logging.debug(f"Monitor callback error: {e}")
+        logging.error(f"Monitor worker error: {e}")
 
 
 def audio_writer_worker():
-    """Background thread that writes continuous audio data to FFmpeg stdin."""
-    pipe_broken_logged = False
+    """Background thread that writes continuous audio data to the active AudioWriter.
+    
+    IMPORTANT: Do NOT gate writes on application state. The active_writer being
+    set to None is the authoritative signal to stop writing. Checking state here
+    introduces a TOCTOU race condition where chunks are consumed from the queue
+    but silently discarded during brief state transitions (e.g. SWITCHING),
+    which creates audible pops/clicks in the output file.
+    """
     while True:
         try:
             chunk = state.audio_queue.get()
-            if state.get_state() == state.STATE_RECORDING and state.ffmpeg_process and state.ffmpeg_process.stdin:
-                try:
-                    state.ffmpeg_process.stdin.write(chunk)
-                    pipe_broken_logged = False
-                except (BrokenPipeError, OSError):
-                    if not pipe_broken_logged:
-                        logging.debug("FFmpeg stdin pipe closed, waiting for new process")
-                        pipe_broken_logged = True
-                except Exception as e:
-                    if not pipe_broken_logged:
+            with state.writer_lock:
+                if state.active_writer:
+                    try:
+                        state.active_writer.write(chunk)
+                    except Exception as e:
                         logging.debug(f"Audio writer error: {e}")
-                        pipe_broken_logged = True
         except Exception:
             pass
-
-
-def audio_callback_factory(idx: int):
-    """Factory for simple meter callbacks used during device discovery."""
-    def cb(indata, frames, time_info, status):
-        try:
-            rms = np.sqrt(np.mean(indata**2))
-            with state.meter_lock:
-                state.meter_data[idx] = rms
-                state.meter_peaks[idx] = max(state.meter_peaks.get(idx, 0.0), rms)
-        except Exception:
-            pass
-    return cb
 
 
 def stop_monitor_stream() -> None:
     """Stops the active audio monitor stream safely."""
     try:
-        if state.active_monitor_stream:
-            state.active_monitor_stream.stop()
-            state.active_monitor_stream.close()
-            state.active_monitor_stream = None
+        _monitor_stop_event.set()
+        if state.active_monitor_stream and state.active_monitor_stream.is_alive():
+            state.active_monitor_stream.join(timeout=1.0)
+        state.active_monitor_stream = None
     except Exception as e:
         logging.error(f"Monitor stop failed: {e}")
 
 
-def start_monitor(idx: int, sr: int, ch: int, cfg) -> bool:
-    """Binds to audio device for continuous metering and capture."""
+def start_monitor(mic_id: str, sr: int, ch: int, cfg) -> bool:
+    """Spawns the monitoring worker thread."""
     if ch < 2 and cfg['SafetyChecks'].getboolean('validate_stereo'):
         logging.error("Stereo validation failed: need at least 2 channels")
         return False
 
     try:
         stop_monitor_stream()
+        _monitor_stop_event.clear()
 
-        state.active_monitor_stream = sd.InputStream(
-            device=idx,
-            channels=min(2, ch),
-            samplerate=sr,
-            dtype='float32',
-            callback=live_monitor_callback,
-            blocksize=1024,
-            latency='low'
+        state.active_monitor_stream = threading.Thread(
+            target=_audio_monitor_worker, 
+            args=(mic_id, sr, ch), 
+            daemon=True
         )
         state.active_monitor_stream.start()
-        logging.info(f"Monitor started on device {idx} at {sr}Hz")
         return True
     except Exception as e:
-        logging.error(f"Monitor bind failed: {e}")
+        logging.error(f"Monitor start failed: {e}")
         return False
 
 

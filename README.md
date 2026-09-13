@@ -17,8 +17,10 @@
 
 ## ✨ Features
 
-- 🎵 Real-Time Recording (FLAC or OGG)
-- 🎯 Track Splitting via Spotify API
+- 🎵 Real-Time Recording (FLAC or OGG/MP3)
+- 🎯 Zero-API Track Monitoring (via OS Media Events)
+- 🔌 Zero-Config Audio Capture (WASAPI Loopback - No Virtual Cables needed!)
+- 🎼 Native FLAC Encoding (`soundfile`) — Zero FFmpeg dependency required for FLAC
 - 🎼 Metadata Embedding: title, artist, album, and cover art
 - ⚙️ Background Finalization for smooth capture
 - 📁 File Organization: Automatically sort by Artist/Album
@@ -36,40 +38,33 @@ SpytoRec v8.1.0+ is now an installable Python package.
 
 ### 🪟 Windows
 
-1. Install **Python 3.8+** from [python.org](https://www.python.org/downloads/windows/)
-2. Install **FFmpeg**:
-   - Download from [gyan.dev FFmpeg builds](https://www.gyan.dev/ffmpeg/builds/)
-   - Extract it and add the `/bin` folder to your `PATH`
-3. Install **VB-Audio Cable** from [vb-audio.com](https://vb-audio.com/Cable/)
-4. Clone the repo and install the package:
+1. Install **Python 3.10+** from [python.org](https://www.python.org/downloads/windows/)
+2. Clone the repo and install the package:
    ```bash
    git clone https://github.com/Danidukiyu/spytorec.git
    cd spytorec
    pip install -e .
    ```
-5. Set Spotify output to **CABLE Input**, and run:
+3. Run the tool (It will automatically detect and record from your default audio output!):
    ```bash
    spytorec
    ```
+
+> [!NOTE]
+> **Optional (MP3 Encoding):** Native recording defaults to FLAC. If you want to save as `.mp3`, you must install **FFmpeg** and add it to your `PATH`.
 
 ---
 
 ### 🍏 macOS
 
-1. Install **Python 3.8+** (via [Homebrew](https://brew.sh/) or [python.org](https://www.python.org/downloads/macos/))
-2. Install **FFmpeg**:
-   ```bash
-   brew install ffmpeg
-   ```
-3. Install **BlackHole (2ch)** via [BlackHole GitHub](https://github.com/ExistentialAudio/BlackHole)
-4. Set Spotify output to BlackHole in System Preferences > Sound > Output
-5. Clone and install the package:
+1. Install **Python 3.10+** (via [Homebrew](https://brew.sh/) or [python.org](https://www.python.org/downloads/macos/))
+2. Clone and install the package:
    ```bash
    git clone https://github.com/Danidukiyu/spytorec.git
    cd spytorec
    pip install -e .
    ```
-6. Run the tool:
+3. Run the tool:
    ```bash
    spytorec
    ```
@@ -153,23 +148,15 @@ spytorec --help
 
 With the v8.1.0 modular package foundation in place, here are the major architectural upgrades planned for the future. Pull requests for any of these are highly encouraged!
 
-### 1. Eliminate Virtual Cables (WASAPI Loopback)
-* **Goal:** Make the app "plug-and-play" without requiring users to install VB-Cable or BlackHole.
-* **How:** Leverage `sounddevice` WASAPI loopback support (Windows) to capture audio directly from the default speaker output (what the user actually hears).
-
-### 2. Eliminate FFmpeg Dependency (Native Encoding)
-* **Goal:** Remove the requirement for users to install and configure `ffmpeg.exe` in their system PATH.
-* **How:** Since we already capture raw PCM float32 data in Python via `numpy`, we can use `soundfile` (which wraps `libsndfile`) to encode directly to FLAC natively within Python. Zero subprocesses, zero broken pipes.
-
-### 3. Zero-Latency Track Changes (OS Media APIs)
+### 1. Zero-Latency Track Changes (OS Media APIs)
 * **Goal:** Stop depending on the Spotify Web API on Linux (quota limits, latency, and now blocked entirely for non-Premium accounts) and read playback from the OS / local Spotify app instead, like Windows and macOS.
 * **How:** Hook into the OS-level media events (on Linux, `PropertiesChanged` signals from `org.mpris.MediaPlayer2.spotify` over MPRIS/D-Bus, which also carries real Spotify track ids and cover art urls) to get zero-latency event triggers the exact millisecond a track changes.
 
-### 4. Standalone Executable
+### 2. Standalone Executable
 * **Goal:** Allow non-developers to run SpytoRec without installing Python or `pip`.
 * **How:** Use `PyInstaller` or `Nuitka` to compile the entire Python package into a single, portable `SpytoRec.exe` executable.
 
-### 5. Interactive TUI
+### 3. Interactive TUI
 * **Goal:** Upgrade from a static logging UI to a fully interactive terminal application.
 * **How:** Migrate from `rich` to `Textual` to add mouse support, clickable tabs, scrolling logs, and a built-in interactive settings menu.
 

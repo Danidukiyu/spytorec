@@ -19,7 +19,7 @@ STATE_SKIPPED = 'Skipped'
 
 VALID_STATE_TRANSITIONS = {
     STATE_INIT: {STATE_IDLE, STATE_ERROR, STATE_MONITORING},
-    STATE_IDLE: {STATE_MONITORING, STATE_ERROR},
+    STATE_IDLE: {STATE_MONITORING, STATE_RECORDING, STATE_ERROR, STATE_SKIPPED},
     STATE_MONITORING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR, STATE_SKIPPED, STATE_SWITCHING},
     STATE_RECORDING: {STATE_SWITCHING, STATE_STOPPING, STATE_ERROR, STATE_RECOVERING},
     STATE_SWITCHING: {STATE_RECORDING, STATE_IDLE, STATE_ERROR},
@@ -40,7 +40,6 @@ HEARTBEAT_TIMEOUT = 5.0
 # --- Thread-Safe Shared State ---
 state_lock = threading.Lock()
 meter_lock = threading.Lock()
-ffmpeg_lock = threading.Lock()
 
 current_state = STATE_INIT
 last_error_msg = ""
@@ -48,7 +47,7 @@ failed_recordings = deque(maxlen=5)
 error_count = 0
 last_heartbeat = time.time()
 
-# Audio Telemetry Globals
+# Audio Telemetry Globals (updated from meter_queue by main loop)
 meter_data = {}
 meter_peaks = {}
 live_rms_l, live_rms_r = 0.0, 0.0
@@ -59,15 +58,13 @@ mono_warning_frames = 0
 
 # Queues
 metadata_queue = queue.Queue()
-audio_queue = queue.Queue(maxsize=200)
 stop_event = threading.Event()
 
 # Process & Stream References
 watchdog_proc_ref = None
 watchdog_file_ref = None
-active_monitor_stream = None
 current_track_id_ref = None
-ffmpeg_process = None
+is_recording = False  # Simple flag, set by main loop when audio process is recording
 
 
 def set_state(new_state: str, msg: str = "") -> bool:
