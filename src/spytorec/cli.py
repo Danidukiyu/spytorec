@@ -504,6 +504,8 @@ def main():
         # Finalise a recording still in progress at shutdown (e.g. 'q' mid-track),
         # otherwise its .tmp file is left untagged and unnamed.
         if state.is_recording:
+            # Leaves RECORDING, which the watchdog checks the process under
+            state.set_state(state.STATE_STOPPING)
             stop_recording()
             state.is_recording = False
             time.sleep(0.2)  # Give audio process time to finalize FLAC
