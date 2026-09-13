@@ -25,7 +25,7 @@ from spytorec.boundary import BLOCKSIZE, BoundaryTracker
 
 def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
                   mic_id: str, sr: int, ch: int, smooth_meter: bool,
-                  boundary: dict = None):
+                  mic_name: str = None, boundary: dict = None):
     """Child process entry point. Captures WASAPI audio and encodes to FLAC.
     
     This function runs in its own process with its own GIL, so it is never
@@ -36,11 +36,9 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
     import soundcard as sc
     import soundfile as sf
 
-    # Find the loopback device
-    mics = sc.all_microphones(include_loopback=True)
-    mic = next((m for m in mics if m.id == mic_id), None)
+    mic = find_device(sc.all_microphones(include_loopback=True), mic_id, mic_name)
     if not mic:
-        logging.error(f"Audio process: device not found: {mic_id}")
+        logging.error(f"Audio process: device not found: {mic_id} ({mic_name})")
         return
 
     # State
@@ -173,6 +171,16 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
         logging.info("Audio process exited")
 
 
+def find_device(mics, mic_id, mic_name=None):
+    """The saved device: by id, compared as text, or failing that by name.
+    CoreAudio renumbers its integer ids whenever a device is opened elsewhere.
+    """
+    by_id = next((m for m in mics if str(m.id) == str(mic_id)), None)
+    if by_id is not None or not mic_name:
+        return by_id
+    return next((m for m in mics if m.name == mic_name), None)
+
+
 def _write(writer, blocks) -> None:
     for block in blocks:
         try:
@@ -202,8 +210,9 @@ _event_q = None
 
 
 def start_audio_process(mic_id: str, sr: int, ch: int, smooth_meter: bool = True,
-                        boundary: dict = None):
+                        mic_name: str = None, boundary: dict = None):
     """Spawn the isolated audio child process.
+    `mic_name` finds the device should `mic_id` no longer (see find_device).
     `boundary` holds the BoundaryTracker settings (see boundary.settings_from_config).
     """
     global _audio_proc, _control_q, _meter_q, _event_q
@@ -214,7 +223,7 @@ def start_audio_process(mic_id: str, sr: int, ch: int, smooth_meter: bool = True
 
     _audio_proc = mp.Process(
         target=_audio_worker,
-        args=(_control_q, _meter_q, _event_q, mic_id, sr, ch, smooth_meter, boundary),
+        args=(_control_q, _meter_q, _event_q, mic_id, sr, ch, smooth_meter, mic_name, boundary),
         daemon=True
     )
     _audio_proc.start()
