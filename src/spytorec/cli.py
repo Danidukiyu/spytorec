@@ -238,7 +238,7 @@ def main():
     state.set_state(state.STATE_MONITORING)
 
     try:
-        with Live(Panel(Text("Waiting for Spotify...", style="yellow")), refresh_per_second=10) as live:
+        with Live(Panel(Text("Waiting for Spotify...", style="yellow")), refresh_per_second=10, screen=True) as live:
             while not state.stop_event.is_set():
                 try:
                     # Update metering from audio process
