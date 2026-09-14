@@ -5,8 +5,12 @@ with its own GIL, completely isolated from UI rendering, Spotify polling,
 and keyboard handling in the main process.
 
 Communication:
-  control_queue (main → audio):  ("start", file_path, bit_depth) | ("stop",) | ("shutdown",)
-  meter_queue   (audio → main):  (rms_l, rms_r, peak_l, peak_r, is_alive)
+  control_queue (main → audio):  ("start", file_path, bit_depth, lead_ms) | ("stop",) | ("shutdown",)
+  meter_queue   (audio → main):  (rms_l, rms_r, peak_l, peak_r, raw_l, raw_r)
+  event_queue   (audio → main):  ("opened", replayed_ms, waited, capture_delay_ms)
+
+Every captured block goes through a BoundaryTracker, which opens each
+recording on the track's first beat (see boundary.py).
 """
 
 import time
@@ -17,9 +21,11 @@ from pathlib import Path
 
 import numpy as np
 
+from spytorec.boundary import BLOCKSIZE, BoundaryTracker
 
-def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
-                  mic_id: str, sr: int, ch: int, smooth_meter: bool):
+def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
+                  mic_id: str, sr: int, ch: int, smooth_meter: bool,
+                  boundary: dict = None):
     """Child process entry point. Captures WASAPI audio and encodes to FLAC.
     
     This function runs in its own process with its own GIL, so it is never
@@ -39,6 +45,7 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
 
     # State
     writer = None  # sf.SoundFile or None
+    tracker = BoundaryTracker(sr, **(boundary or {}))
     smoothed_l, smoothed_r = 0.0, 0.0
     peak_l, peak_r = 0.0, 0.0
     alpha = 0.4 if smooth_meter else 1.0
@@ -55,7 +62,7 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
                         cmd = control_q.get_nowait()
                         
                         if cmd[0] == "start":
-                            _, file_path, bit_depth = cmd
+                            _, file_path, bit_depth, lead_ms = cmd
                             subtype_map = {'16': 'PCM_16', '24': 'PCM_24', '32': 'PCM_24'}
                             subtype = subtype_map.get(bit_depth, 'PCM_16')
                             
@@ -75,8 +82,16 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
                                 format='FLAC'
                             )
                             logging.info(f"Audio process: recording to {file_path}")
+
+                            # The track's opening, as far as it is captured
+                            opening, holding = tracker.begin(lead_ms)
+                            _write(writer, opening)
+                            if not holding:
+                                _notify(event_q, "opened", _ms(opening, sr), False,
+                                        tracker.capture_delay_ms)
                         
                         elif cmd[0] == "stop":
+                            tracker.end()
                             if writer is not None:
                                 try:
                                     writer.close()
@@ -86,6 +101,7 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
                                 logging.info("Audio process: stopped recording")
                         
                         elif cmd[0] == "shutdown":
+                            tracker.end()
                             if writer is not None:
                                 try:
                                     writer.close()
@@ -99,7 +115,7 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
 
                 # ── 2. Capture audio ──
                 try:
-                    indata = recorder.record(numframes=1024)
+                    indata = recorder.record(numframes=BLOCKSIZE)
                 except Exception:
                     time.sleep(0.01)
                     continue
@@ -136,11 +152,15 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
                     last_meter_send = now
 
                 # ── 4. Write to FLAC (if recording) ──
+                # The tracker returns what the writer takes: nothing while
+                # holding for the boundary, the held opening once it passes
+                was_holding = tracker.holding
+                due = tracker.push(indata)
                 if writer is not None:
-                    try:
-                        writer.write(np.clip(indata, -1.0, 1.0))
-                    except Exception as e:
-                        logging.error(f"Audio process: write error: {e}")
+                    _write(writer, due)
+                    if was_holding and not tracker.holding:
+                        _notify(event_q, "opened", _ms(due, sr), True,
+                                tracker.capture_delay_ms)
 
     except Exception as e:
         logging.error(f"Audio process fatal error: {e}")
@@ -153,23 +173,48 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue,
         logging.info("Audio process exited")
 
 
+def _write(writer, blocks) -> None:
+    for block in blocks:
+        try:
+            writer.write(np.clip(block, -1.0, 1.0))
+        except Exception as e:
+            logging.error(f"Audio process: write error: {e}")
+
+
+def _ms(blocks, sr: int) -> float:
+    return sum(len(b) for b in blocks) / sr * 1000
+
+
+def _notify(event_q, *event) -> None:
+    """Reports to the main process without waiting; dropped when the queue is full."""
+    try:
+        event_q.put_nowait(event)
+    except Exception:
+        pass
+
+
 # ── Public API for the main process ──────────────────────────────────
 
 _audio_proc = None
 _control_q = None
 _meter_q = None
+_event_q = None
 
 
-def start_audio_process(mic_id: str, sr: int, ch: int, smooth_meter: bool = True):
-    """Spawn the isolated audio child process."""
-    global _audio_proc, _control_q, _meter_q
+def start_audio_process(mic_id: str, sr: int, ch: int, smooth_meter: bool = True,
+                        boundary: dict = None):
+    """Spawn the isolated audio child process.
+    `boundary` holds the BoundaryTracker settings (see boundary.settings_from_config).
+    """
+    global _audio_proc, _control_q, _meter_q, _event_q
 
     _control_q = mp.Queue(maxsize=10)
     _meter_q = mp.Queue(maxsize=5)
+    _event_q = mp.Queue(maxsize=50)
 
     _audio_proc = mp.Process(
         target=_audio_worker,
-        args=(_control_q, _meter_q, mic_id, sr, ch, smooth_meter),
+        args=(_control_q, _meter_q, _event_q, mic_id, sr, ch, smooth_meter, boundary),
         daemon=True
     )
     _audio_proc.start()
@@ -186,9 +231,11 @@ def send_command(*cmd):
             logging.error(f"Failed to send audio command {cmd[0]}: {e}")
 
 
-def start_recording(file_path, bit_depth='24'):
-    """Tell the audio process to start recording to the given path."""
-    send_command("start", str(file_path), bit_depth)
+def start_recording(file_path, bit_depth='24', lead_ms=0.0):
+    """Tell the audio process to start recording to the given path.
+    `lead_ms` is how far into the track the source reports it.
+    """
+    send_command("start", str(file_path), bit_depth, lead_ms)
 
 
 def stop_recording():
@@ -220,6 +267,17 @@ def read_meters():
         return _meter_q.get_nowait()
     except Exception:
         return None
+
+
+def read_events():
+    """Yields every ("opened", replayed_ms, waited, capture_delay_ms) event since the last call."""
+    if _event_q is None:
+        return
+    while True:
+        try:
+            yield _event_q.get_nowait()
+        except Exception:
+            return
 
 
 def is_audio_alive():
