@@ -26,7 +26,7 @@ from spytorec.config import load_config, setup_logging, console
 from spytorec.utils import resolve_path, KBHit, LOCK_FILE_PATH
 from spytorec.audio_process import (
     start_audio_process, start_recording, stop_recording,
-    shutdown_audio_process, read_meters, read_events, is_audio_alive
+    shutdown_audio_process, read_meters, read_events, is_audio_alive, find_device
 )
 from spytorec.boundary import settings_from_config
 from spytorec.recording import (
@@ -119,8 +119,9 @@ def main():
     if hw_ready:
         try:
             saved_id = cfg['Recording'].get('device_id')
+            saved_name = cfg['Recording'].get('ffmpeg_name')
             mics = sc.all_microphones(include_loopback=True)
-            if not any(m.id == saved_id for m in mics):
+            if find_device(mics, saved_id, saved_name) is None:
                 console.print("[yellow]Previously saved audio device not found. Re-scanning...[/yellow]")
                 hw_ready = False
         except Exception:
@@ -256,7 +257,7 @@ def main():
             logging.info(f"Capture gain: '{hw_name}' {change}")
             console.print(f"[yellow]Capture gain corrected: '{hw_name}' {change}[/yellow]")
 
-    start_audio_process(hw_idx, sr, ch, smooth_meter, settings_from_config(cfg))
+    start_audio_process(hw_idx, sr, ch, smooth_meter, hw_name, settings_from_config(cfg))
 
     state.set_state(state.STATE_MONITORING)
     last_poll_done = time.monotonic()
@@ -503,6 +504,8 @@ def main():
         # Finalise a recording still in progress at shutdown (e.g. 'q' mid-track),
         # otherwise its .tmp file is left untagged and unnamed.
         if state.is_recording:
+            # Leaves RECORDING, which the watchdog checks the process under
+            state.set_state(state.STATE_STOPPING)
             stop_recording()
             state.is_recording = False
             time.sleep(0.2)  # Give audio process time to finalize FLAC
