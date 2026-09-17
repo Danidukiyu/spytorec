@@ -170,6 +170,8 @@ With the v8.1.0 modular package foundation in place, here are the major architec
 Pull requests and stars ⭐ are welcome!  
 Fork the repo, give it a star, and help build more useful tools for personal music archiving!
 
+Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing to ensure a welcoming environment for everyone.
+
 ---
 
 ## 🙏 Contributors
