@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     'Recording': {
         'device_id': '', 'ffmpeg_name': '', 'sample_rate': 'auto', 'bit_depth': '24',
         'channels': '2', 'output_format': 'flac', 'output_directory': 'Recordings',
-        'auto_start': 'false', 'overwrite_existing': 'false', 'force_safe_mode': 'false',
+        'auto_start': 'false', 'overwrite_existing': 'false',
         'max_retries': '3', 'retry_delay': '1', 'preroll_seconds': '5',
         'capture_delay_ms': '600', 'boundary_window_ms': '800',
         'force_unity_gain': 'true'
