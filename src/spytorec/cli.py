@@ -256,8 +256,6 @@ def main():
                 console.print(f"[red]\u2717 Failed to save: {track['name']}[/red]")
 
     # Initialize recording params
-    sr = int(cfg['Recording'].get('sample_rate', '48000'))
-    ch = int(cfg['Recording'].get('channels', '2'))
     bit_depth = cfg['Recording'].get('bit_depth', '24')
 
     # Initialize keyboard listener
