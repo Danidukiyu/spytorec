@@ -222,8 +222,6 @@ def main():
                                result.get('error', 'Could not save recording'))
 
     # Initialize recording params
-    sr = int(cfg['Recording'].get('sample_rate', '48000'))
-    ch = int(cfg['Recording'].get('channels', '2'))
     bit_depth = cfg['Recording'].get('bit_depth', '24')
 
     # Initialize keyboard listener
