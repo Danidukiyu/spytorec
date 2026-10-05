@@ -16,10 +16,31 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.live import Live
 
-from spytorec import state
+from spytorec import state, coreaudio
 from spytorec.config import console
 from spytorec.utils import file_lock, CONFIG_FILE_PATH, LOCK_FILE_PATH, KBHit
 from spytorec.ui import SP_GREEN, SP_GREEN_DIM, SP_GREY
+
+_FALLBACK_RATE = 48000
+
+
+def capture_rate(setting: str, device_name: str) -> int:
+    """
+    The rate to record `device_name` at.
+    """
+    device_rate = coreaudio.nominal_rate(device_name)
+
+    if setting == 'auto':
+        if device_rate:
+            return device_rate
+        logging.info(f"Sample rate of {device_name} unknown; recording at {_FALLBACK_RATE}Hz")
+        return _FALLBACK_RATE
+
+    rate = int(setting)
+    if device_rate and device_rate != rate:
+        logging.warning(f"{device_name} runs at {device_rate}Hz; resampling to {rate}Hz "
+                        f"(sample_rate = auto records at the device's rate)")
+    return rate
 
 
 def _meter_worker(mic_id: str, mic, stop_event: threading.Event):
@@ -67,6 +88,7 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, str, int, int]:
 
     selected = None
     buf = ""
+    rates = {mic.id: coreaudio.nominal_rate(mic.name) for mic in mics}
 
     def build_hw_table():
         t = Table(title=f"[{SP_GREEN}]Hardware Selection[/{SP_GREEN}]")
@@ -90,7 +112,7 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, str, int, int]:
                 t.add_row(
                     f"[{count}]",
                     f"[{style}]{name_display}[/{style}]",
-                    f"[{style}]48000Hz | 2ch[/{style}]",
+                    f"[{style}]{rates[mic.id] or '?'}Hz | 2ch[/{style}]",
                     f"[{SP_GREEN_DIM}]" + "\u2588" * level + f"[/{SP_GREEN_DIM}]" if has_audio else "[dim]" + "\u2501" * 5 + "[/dim]"
                 )
                 rows[count] = mic
@@ -143,9 +165,7 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, str, int, int]:
     # Save to config
     cfg.set('Recording', 'ffmpeg_name', selected.name)
     cfg.set('Recording', 'device_id', str(selected.id))
-    # Soundcard generally works best internally if we just request standard rates,
-    # it auto-resamples if needed.
-    cfg.set('Recording', 'sample_rate', '48000')
+    cfg.set('Recording', 'sample_rate', 'auto')
     cfg.set('Recording', 'channels', '2')
 
     try:
@@ -155,4 +175,4 @@ def discover_hardware(ffmpeg_path: str, cfg) -> Tuple[str, str, int, int]:
     except Exception as e:
         console.print(f"[yellow]Could not save config: {e}[/yellow]")
 
-    return selected.name, selected.id, 48000, 2
+    return selected.name, selected.id, capture_rate('auto', selected.name), 2

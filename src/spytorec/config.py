@@ -28,7 +28,7 @@ console = Console()
 
 DEFAULT_CONFIG = {
     'Recording': {
-        'device_id': '', 'ffmpeg_name': '', 'sample_rate': '48000', 'bit_depth': '24',
+        'device_id': '', 'ffmpeg_name': '', 'sample_rate': 'auto', 'bit_depth': '24',
         'channels': '2', 'output_format': 'flac', 'output_directory': 'Recordings',
         'auto_start': 'false', 'overwrite_existing': 'false', 'force_safe_mode': 'false',
         'max_retries': '3', 'retry_delay': '1', 'preroll_seconds': '5',
@@ -93,8 +93,8 @@ def load_config() -> configparser.ConfigParser:
                 cfg.set(section, key, val)
                 modified = True
 
-    if cfg.get('Recording', 'sample_rate') not in ['44100', '48000', '96000']:
-        cfg.set('Recording', 'sample_rate', '48000')
+    if cfg.get('Recording', 'sample_rate') not in ['auto', '44100', '48000', '96000']:
+        cfg.set('Recording', 'sample_rate', 'auto')
         modified = True
 
     if cfg.get('Recording', 'bit_depth') not in ['16', '24', '32']:
