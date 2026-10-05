@@ -35,7 +35,7 @@ from spytorec.recording import (
 from spytorec.spotify.selector import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
 from spytorec.webhooks import send_webhook
-from spytorec.hardware import discover_hardware
+from spytorec.hardware import discover_hardware, capture_rate
 from spytorec.writers import FFmpegMp3Writer
 from spytorec.ui import (
     build_dashboard, build_history_table,
@@ -154,7 +154,7 @@ def main():
         else:
             hw_name = cfg['Recording'].get('ffmpeg_name')
             hw_idx = cfg['Recording'].get('device_id')
-            hw_sr = int(cfg['Recording'].get('sample_rate'))
+            hw_sr = capture_rate(cfg['Recording'].get('sample_rate'), hw_name)
             hw_ch = int(cfg['Recording'].get('channels'))
     else:
         hw_name, hw_idx, hw_sr, hw_ch = discover_hardware(args.ffmpeg, cfg)

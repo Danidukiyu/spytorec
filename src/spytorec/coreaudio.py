@@ -1,4 +1,5 @@
-"""macOS CoreAudio: pins the capture device to unity gain.
+"""
+macOS CoreAudio: reads the capture device's sample rate and pins it to unity gain.
 
 The system volume slider writes to a loopback device's own volume, on both
 scopes, and that attenuation lands in the recording. No-op off macOS.
@@ -27,6 +28,7 @@ _NAME = _fourcc('lnam')             # kAudioObjectPropertyName
 _STREAMS = _fourcc('slay')          # kAudioDevicePropertyStreamConfiguration
 _VOLUME = _fourcc('volm')           # kAudioDevicePropertyVolumeScalar
 _MUTE = _fourcc('mute')             # kAudioDevicePropertyMute
+_RATE = _fourcc('nsrt')             # kAudioDevicePropertyNominalSampleRate
 
 _SCOPE_GLOBAL = _fourcc('glob')
 _SCOPE_INPUT = _fourcc('inpt')
@@ -176,6 +178,22 @@ def _find_input_device(name: str):
         if _device_name(device) == name and _input_channels(device) > 0:
             return device
     return None
+
+
+def nominal_rate(device_name: str):
+    """The rate `device_name` runs at, in Hz. None for an unknown device."""
+    if not _load() or not device_name:
+        return None
+
+    try:
+        device = _find_input_device(device_name)
+        if device is None:
+            return None
+        rate = _get(device, _RATE, _SCOPE_GLOBAL, ctypes.c_double)
+        return int(round(rate)) if rate else None
+    except Exception as e:
+        logging.debug(f"Sample rate unknown for '{device_name}': {e}")
+        return None
 
 
 def force_unity_gain(device_name: str) -> list:

@@ -1,4 +1,4 @@
-"""Tests for the capture device's unity-gain correction. The live case runs on macOS only."""
+"""Tests for the capture device's sample rate and unity-gain correction. The live cases run on macOS only."""
 
 import ctypes
 import sys
@@ -20,11 +20,17 @@ class ForceUnityGainTests(unittest.TestCase):
 
     def test_unknown_device_is_not_an_error(self):
         self.assertEqual(coreaudio.force_unity_gain('No Such Device 4c1f'), [])
+        self.assertIsNone(coreaudio.nominal_rate('No Such Device 4c1f'))
 
 
 @unittest.skipUnless(sys.platform == 'darwin', "needs CoreAudio")
 class LiveCoreAudioTests(unittest.TestCase):
     """Against the machine's real devices."""
+
+    def test_every_input_device_reports_a_rate(self):
+        coreaudio._load()
+        for name in self._input_device_names():
+            self.assertGreaterEqual(coreaudio.nominal_rate(name) or 0, 8000, name)
 
     def test_correction_restores_unity(self):
         """Turns a real device down, corrects it, and restores the level it was found at."""
