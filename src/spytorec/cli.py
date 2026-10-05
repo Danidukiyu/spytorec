@@ -42,6 +42,10 @@ from spytorec.ui import (
     SP_GREEN, SP_GREEN_DIM, SP_GREY, SP_DARK
 )
 
+# How long a stopped recording waits for the audio process to close its file;
+# one closing on the next track's boundary takes up to ~3s
+CLOSE_TIMEOUT_S = 10.0
+
 
 def cleanup_resources():
     """Clean up all resources before exit."""
@@ -212,9 +216,24 @@ def main():
     finalizer = BackgroundFinalizer(finalize_track)
     finalizer.start()
 
+    # Stopped recordings the audio process has yet to close, by path:
+    # (track, file, when to stop waiting)
+    unclosed = {}
+
     def save_current(track, tmp):
-        """Hands a finished recording to the finaliser thread."""
-        finalizer.submit(track, tmp)
+        """Hands a stopped recording to the finaliser thread once its file is closed."""
+        unclosed[str(tmp)] = (track, tmp, time.monotonic() + CLOSE_TIMEOUT_S)
+
+    def submit_closed(closed=(), all_of_them=False):
+        """Submits the recordings in `closed`, and any waited on too long."""
+        now = time.monotonic()
+        for path, (track, tmp, deadline) in list(unclosed.items()):
+            if path not in closed and not all_of_them:
+                if now < deadline:
+                    continue
+                logging.warning(f"No word the audio process closed {tmp.name}; saving it anyway")
+            del unclosed[path]
+            finalizer.submit(track, tmp)
 
     def drain_results():
         """Applies finished saves to the session tally and history."""
@@ -274,11 +293,17 @@ def main():
                         state.raw_l, state.raw_r = meters[4], meters[5]
                         state.last_heartbeat = time.time()
 
-                    # Where the audio process opened each recording
-                    for _, replayed_ms, waited, delay_ms in read_events():
+                    # Where the audio process opened each recording, and which it closed
+                    closed = set()
+                    for event in read_events():
+                        if event[0] == "closed":
+                            closed.add(event[1])
+                            continue
+                        _, replayed_ms, waited, delay_ms = event
                         how = "held for the boundary" if waited else "replayed from the buffer"
                         logging.info(f"Opened recording: {replayed_ms:.0f}ms {how}, "
                                      f"capture delay now {delay_ms:.0f}ms")
+                    submit_closed(closed)
 
                     # Check for error state set by watchdog and recover
                     if state.get_state() == state.STATE_ERROR:
@@ -315,14 +340,16 @@ def main():
 
                         # Handle track change
                         if track_id != current_id:
-                            # Stop current recording if any
+                            # How far into the track the source reports it.
+                            # progress_ms measures this; the poll gap bounds it,
+                            # and stands in for sources that step or omit it.
+                            reported_ms = playback.get('progress_ms', 0) or poll_gap_ms
+
+                            # Stop current recording if any, short of this track's opening
                             if state.is_recording:
                                 state.set_state(state.STATE_SWITCHING)
-                                stop_recording()
+                                stop_recording(reported_ms + (time.monotonic() - poll_started) * 1000)
                                 state.is_recording = False
-
-                                # Give the audio process a moment to finalize the FLAC
-                                time.sleep(0.1)
 
                                 if temp_file and current_track:
                                     save_current(current_track, temp_file)
@@ -360,12 +387,7 @@ def main():
                             # Start new recording
                             bit_depth = cfg['Recording'].get('bit_depth', '24')
 
-                            # How far into the track the source reports it.
-                            # progress_ms measures this; the poll gap bounds it,
-                            # and stands in for sources that step or omit it.
-                            progress_ms = playback.get('progress_ms', 0)
-                            lead_ms = (progress_ms or poll_gap_ms) + \
-                                (time.monotonic() - poll_started) * 1000
+                            lead_ms = reported_ms + (time.monotonic() - poll_started) * 1000
 
                             # Named by nanosecond: two recordings can start within a second
                             temp_file = out_dir / f".tmp_{time.time_ns()}.{output_format}"
@@ -513,6 +535,9 @@ def main():
         if temp_file and current_track and temp_file.exists():
             save_current(current_track, temp_file)
             temp_file = None
+
+        # The audio process has exited, so every file is closed
+        submit_closed(all_of_them=True)
 
         # Queued saves finish before the summary counts them
         if finalizer.busy:

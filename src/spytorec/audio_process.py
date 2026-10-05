@@ -5,12 +5,14 @@ with its own GIL, completely isolated from UI rendering, Spotify polling,
 and keyboard handling in the main process.
 
 Communication:
-  control_queue (main → audio):  ("start", file_path, bit_depth, lead_ms) | ("stop",) | ("shutdown",)
+  control_queue (main → audio):  ("start", file_path, bit_depth, lead_ms) | ("stop", lead_ms) | ("shutdown",)
   meter_queue   (audio → main):  (rms_l, rms_r, peak_l, peak_r, raw_l, raw_r)
-  event_queue   (audio → main):  ("opened", replayed_ms, waited, capture_delay_ms)
+  event_queue   (audio → main):  ("opened", replayed_ms, waited, capture_delay_ms) | ("closed", file_path)
 
 Every captured block goes through a BoundaryTracker, which opens each
-recording on the track's first beat (see boundary.py).
+recording on the track's first beat and closes it on the next (see boundary.py).
+A recording stopped before the next track reaches the capture stays open
+until it does; "closed" says when its file is complete.
 """
 
 import time
@@ -43,11 +45,45 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
 
     # State
     writer = None  # sf.SoundFile or None
+    closing = None  # the writer before, open until the next track arrives
     tracker = BoundaryTracker(sr, **(boundary or {}))
     smoothed_l, smoothed_r = 0.0, 0.0
     peak_l, peak_r = 0.0, 0.0
     alpha = 0.4 if smooth_meter else 1.0
     last_meter_send = 0.0
+
+    def close(w) -> None:
+        try:
+            w.close()
+        except Exception as e:
+            logging.error(f"Audio process: close error: {e}")
+        _notify(event_q, "closed", w.name)
+
+    def settle_closing() -> None:
+        """Gives the closing writer what it takes, closing it at the boundary."""
+        nonlocal closing
+        if closing is None:
+            return
+        _write(closing, tracker.ending())
+        if not tracker.closing:
+            close(closing)
+            closing = None
+
+    def stop(lead_ms=None) -> None:
+        """Stops the recording; `lead_ms` into the next track, if one follows."""
+        nonlocal writer, closing
+        tail = tracker.end(lead_ms)
+        settle_closing()
+        if writer is None:
+            return
+
+        _write(writer, tail)
+        if tracker.closing:
+            closing = writer
+        else:
+            close(writer)
+        writer = None
+        logging.info("Audio process: stopped recording")
 
     try:
         with mic.recorder(samplerate=sr, channels=min(2, ch)) as recorder:
@@ -64,13 +100,10 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
                             subtype_map = {'16': 'PCM_16', '24': 'PCM_24', '32': 'PCM_24'}
                             subtype = subtype_map.get(bit_depth, 'PCM_16')
                             
-                            # Close any existing writer first
+                            # Stop any existing recording first
                             if writer is not None:
-                                try:
-                                    writer.close()
-                                except Exception:
-                                    pass
-                            
+                                stop(lead_ms)
+
                             writer = sf.SoundFile(
                                 file=str(file_path),
                                 mode='w',
@@ -89,22 +122,11 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
                                         tracker.capture_delay_ms)
                         
                         elif cmd[0] == "stop":
-                            tracker.end()
-                            if writer is not None:
-                                try:
-                                    writer.close()
-                                except Exception as e:
-                                    logging.error(f"Audio process: close error: {e}")
-                                writer = None
-                                logging.info("Audio process: stopped recording")
-                        
+                            # None when no track follows
+                            stop(cmd[1] if len(cmd) > 1 else None)
+
                         elif cmd[0] == "shutdown":
-                            tracker.end()
-                            if writer is not None:
-                                try:
-                                    writer.close()
-                                except Exception:
-                                    pass
+                            stop()
                             logging.info("Audio process: shutting down")
                             return
                 
@@ -154,6 +176,7 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
                 # holding for the boundary, the held opening once it passes
                 was_holding = tracker.holding
                 due = tracker.push(indata)
+                settle_closing()
                 if writer is not None:
                     _write(writer, due)
                     if was_holding and not tracker.holding:
@@ -163,11 +186,7 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
     except Exception as e:
         logging.error(f"Audio process fatal error: {e}")
     finally:
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception:
-                pass
+        stop()
         logging.info("Audio process exited")
 
 
@@ -247,9 +266,12 @@ def start_recording(file_path, bit_depth='24', lead_ms=0.0):
     send_command("start", str(file_path), bit_depth, lead_ms)
 
 
-def stop_recording():
-    """Tell the audio process to stop recording and finalize the file."""
-    send_command("stop")
+def stop_recording(lead_ms=None):
+    """
+    Tell the audio process to stop recording and finalize the file.
+    `lead_ms` is how far into the next track the source reports it, if one follows.
+    """
+    send_command("stop", lead_ms)
 
 
 def shutdown_audio_process():
@@ -279,7 +301,7 @@ def read_meters():
 
 
 def read_events():
-    """Yields every ("opened", replayed_ms, waited, capture_delay_ms) event since the last call."""
+    """Yields every event since the last call (see the module docstring)."""
     if _event_q is None:
         return
     while True:
