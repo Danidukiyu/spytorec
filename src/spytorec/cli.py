@@ -229,9 +229,7 @@ def main():
     kb.set_cbreak()
 
     # Start process-isolated audio pipeline
-    safe_mode = cfg['Recording'].getboolean('force_safe_mode')
-    sr = 44100 if safe_mode else hw_sr
-    ch = 2 if safe_mode else hw_ch
+    sr, ch = hw_sr, hw_ch
     smooth_meter = cfg['UI'].getboolean('smooth_meter_animation', fallback=True)
 
     # The device's own volume attenuates what the loopback captures
@@ -399,9 +397,6 @@ def main():
                             state.stop_event.set()
                         elif key == 'd':
                             cfg['Debug']['show_debug_overlay'] = str(not cfg['Debug'].getboolean('show_debug_overlay'))
-                        elif key == 'f':
-                            cfg['Recording']['force_safe_mode'] = str(not cfg['Recording'].getboolean('force_safe_mode'))
-                            console.print("[yellow]Safe Mode toggled (will apply next track)[/yellow]")
                         elif key == 's' and current_track:
                             track_name = current_track['name']
                             track_skip_id = current_track.get('id', '')

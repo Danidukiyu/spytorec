@@ -143,7 +143,6 @@ def build_shortcut_bar() -> Text:
     return Text.from_markup(
         f"  [{SP_REC_RED}]Q[/{SP_REC_RED}][dim] Quit[/dim]"
         f"   [cyan]D[/cyan][dim] Debug[/dim]"
-        f"   [yellow]F[/yellow][dim] Safe Mode[/dim]"
         f"   [{SP_GREEN_DIM}]S[/{SP_GREEN_DIM}][dim] Skip Track[/dim]"
     )
 
@@ -277,9 +276,6 @@ def build_dashboard(
         dashboard.add_section()
 
         if cfg['UI'].getboolean('show_status_strip'):
-            safe_mode_active = cfg['Recording'].getboolean('force_safe_mode')
-            safe_tag = f"[{SP_SKIP_YELLOW}](SAFE) [/{SP_SKIP_YELLOW}]" if safe_mode_active else ""
-
             status_items = []
             if cfg['QualityDisplay'].getboolean('show_sample_rate'):
                 status_items.append(f"{sr}Hz")
@@ -289,7 +285,7 @@ def build_dashboard(
                 status_items.append(f"{ch}ch")
 
             tech_info = " | ".join(status_items) if status_items else ""
-            status_line = f"{safe_tag}{tech_info} | {output_format.upper()} | {file_size}MB"
+            status_line = f"{tech_info} | {output_format.upper()} | {file_size}MB"
             dashboard.add_row(Text.from_markup(f"[{SP_DARK}]⚙️ {status_line}[/{SP_DARK}]"))
 
         if cfg['QualityDisplay'].getboolean('show_lr_meters'):

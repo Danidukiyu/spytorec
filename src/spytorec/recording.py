@@ -146,31 +146,30 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
 
         # Add album art. fetch_image_bytes takes http(s):// and file:// urls
         # alike; MIME is sniffed from the bytes since a local file has no header.
-        if not cfg['Recording'].getboolean('force_safe_mode'):
-            try:
-                images = track_info['album'].get('images', [])
-                if images:
-                    img_url = images[0]['url']
-                    img_data = fetch_image_bytes(img_url, timeout=3, max_bytes=state.MAX_COVER_ART_BYTES)
-                    if img_data:
-                        mime = sniff_image_mime(img_data)
-                        if mime:
-                            if output_format == 'mp3':
-                                audio.tags.add(
-                                    APIC(encoding=3, mime=mime, type=3, desc='Cover', data=img_data)
-                                )
-                            else:
-                                picture = Picture()
-                                picture.data = img_data
-                                picture.type = 3
-                                picture.mime = mime
-                                picture.desc = "Cover Art"
-                                audio.add_picture(picture)
-                            logging.debug("Added album art")
+        try:
+            images = track_info['album'].get('images', [])
+            if images:
+                img_url = images[0]['url']
+                img_data = fetch_image_bytes(img_url, timeout=3, max_bytes=state.MAX_COVER_ART_BYTES)
+                if img_data:
+                    mime = sniff_image_mime(img_data)
+                    if mime:
+                        if output_format == 'mp3':
+                            audio.tags.add(
+                                APIC(encoding=3, mime=mime, type=3, desc='Cover', data=img_data)
+                            )
                         else:
-                            logging.warning("Unrecognised album art format, skipping")
-            except Exception as e:
-                logging.debug(f"Could not add album art: {e}")
+                            picture = Picture()
+                            picture.data = img_data
+                            picture.type = 3
+                            picture.mime = mime
+                            picture.desc = "Cover Art"
+                            audio.add_picture(picture)
+                        logging.debug("Added album art")
+                    else:
+                        logging.warning("Unrecognised album art format, skipping")
+        except Exception as e:
+            logging.debug(f"Could not add album art: {e}")
 
         audio.save()
 
