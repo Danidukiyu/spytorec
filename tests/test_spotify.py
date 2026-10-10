@@ -8,7 +8,7 @@ from unittest import mock
 from spytorec.spotify.base import TrackSource, make_playback
 from spytorec.spotify.macos_applescript import AppleScriptSource, _SEP
 from spytorec.spotify.selector import get_source
-from spytorec.spotify.windows_smtc import SmtcSource, _WINSDK_AVAILABLE
+from spytorec.spotify.windows_smtc import SmtcSource, _WINRT_AVAILABLE
 
 
 def _fake_cfg():
@@ -144,15 +144,15 @@ class GetSourceTests(unittest.TestCase):
 class SmtcSourceTests(unittest.TestCase):
     """Covers the pure logic (session pick, timeline math, art short-circuit).
 
-    winsdk itself is Windows-only and isn't installed in this environment, so
+    winrt itself is Windows-only and isn't installed in this environment, so
     the parts that call into it directly (connect()'s trial call, get_playback,
     and the WinRT stream-reading half of _save_thumbnail) aren't exercised
     here - see the module docstring for that caveat.
     """
 
-    def test_connect_raises_without_winsdk(self):
-        if _WINSDK_AVAILABLE:
-            self.skipTest("winsdk is installed in this environment")
+    def test_connect_raises_without_winrt(self):
+        if _WINRT_AVAILABLE:
+            self.skipTest("winrt is installed in this environment")
         src = SmtcSource(_fake_cfg())
         with self.assertRaises(RuntimeError):
             src.connect()
