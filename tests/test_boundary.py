@@ -51,6 +51,7 @@ class BoundaryTest(unittest.TestCase):
         written = []
         for level in [0.0] * 120 + [0.5] * 4:         # a 2.5s gap
             written += self.tracker.push(_block(level))
+        written += self.tracker.end()
 
         self.assertEqual(len(written), 4, 'wrote the gap')
         self.assertGreater(min(np.min(b) for b in written), 0.0)
@@ -61,6 +62,7 @@ class BoundaryTest(unittest.TestCase):
         edge = round(600 / BLOCK_MS) + round(800 / BLOCK_MS)
 
         written = self._feed_held([0.4] * edge + [0.0] * 2 + [0.5] * 4)
+        written += len(self.tracker.end())
 
         self.assertGreater(written, 4, 'held past a short silence')
 
@@ -83,8 +85,42 @@ class BoundaryTest(unittest.TestCase):
         self.tracker.begin(200)
 
         written = self._feed_held([0.4] * 16 + [0.0] * 4 + [3e-5] * 3 + [0.5] * 4)
+        written += len(self.tracker.end())
 
         self.assertEqual(written, 7, 'trimmed the fade-in')
+
+    # --- a recording ends where the next track opens ----------------------
+
+    def _record(self, levels) -> list:
+        """Opens a recording on the buffer, then captures `levels` into it."""
+        self._fill(40, level=0.4)
+        opening, holding = self.tracker.begin(20 * BLOCK_MS + self.tracker.capture_delay_ms)
+        self.assertFalse(holding)
+        return opening + [b for level in levels for b in self.tracker.push(_block(level))]
+
+    def test_the_writer_is_kept_behind_the_capture(self):
+        written = self._record([0.4] * 30)
+
+        self.assertEqual(len(written), 20, 'wrote the tail before the recording ended')
+
+    def test_the_next_track_opening_after_a_gap_is_left_out(self):
+        written = self._record([0.4] * 30 + [0.0] * 5 + [0.8] * 12)
+        written += self.tracker.end(12 * BLOCK_MS + self.tracker.capture_delay_ms)
+
+        self.assertEqual(len(written), 20 + 30 + 5)
+        self.assertLess(max(np.max(b) for b in written), 0.8, 'kept the next track')
+
+    def test_the_next_track_opening_without_a_gap_is_left_out_by_the_clock(self):
+        written = self._record([0.4] * 30 + [0.8] * 12)
+        written += self.tracker.end(12 * BLOCK_MS + self.tracker.capture_delay_ms)
+
+        self.assertEqual(len(written), 20 + 30)
+
+    def test_a_recording_with_no_next_track_is_written_whole(self):
+        written = self._record([0.4] * 30)
+        written += self.tracker.end()
+
+        self.assertEqual(len(written), 20 + 30)
 
     # --- the estimate corrects itself -------------------------------------
 
@@ -94,6 +130,7 @@ class BoundaryTest(unittest.TestCase):
         self.tracker.begin(200)
         target = round((self.tracker.capture_delay_ms - 200) / BLOCK_MS)
         self._feed_held([0.4] * (target + late_blocks - 5) + [0.0] * 5 + [0.5] * 4)
+        self.tracker.end()
 
     def test_boundaries_found_late_move_the_estimate_out(self):
         before = self.tracker.capture_delay_ms

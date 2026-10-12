@@ -98,20 +98,23 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
                             lead_ms = cmd[1] if len(cmd) > 1 else None
                             if lead_ms is not None:
                                 lead_ms += command_age_ms
-                            remaining = 0 if lead_ms is None or tracker.holding else \
+                            taken = len(tracker._opening_from_buffer(lead_ms)) if lead_ms is not None else 0
+                            remaining = 0 if lead_ms is None or tracker.holding or taken > 0 else \
                                 round(max(0, tracker.capture_delay_ms - lead_ms) * sr / 1000)
                             if writer is not None and remaining > 0:
-                                pending_stop = (request_id, remaining)
+                                pending_stop = (request_id, remaining, lead_ms)
                             else:
-                                tracker.end()
+                                tail = tracker.end(lead_ms)
                                 if writer is not None:
+                                    _write(writer, tail)
                                     writer.close()
                                     writer = None
                                 _status(status_q, 'ack', request_id)
                         
                         elif cmd[0] == "shutdown":
-                            tracker.end()
+                            tail = tracker.end()
                             if writer is not None:
+                                _write(writer, tail)
                                 writer.close()
                                 writer = None
                             logging.info("Audio process: shutting down")
@@ -161,25 +164,35 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
                 # The tracker returns what the writer takes: nothing while
                 # holding for the boundary, the held opening once it passes
                 was_holding = tracker.holding
-                due = tracker.push(indata)
-                if writer is not None:
-                    if pending_stop is not None:
-                        request_id, remaining = pending_stop
-                        due = [indata[:remaining]]
-                    _write(writer, due)
+                if pending_stop is not None:
+                    request_id, remaining, stop_lead_ms = pending_stop
+                    block = indata[:remaining] if len(indata) > remaining else indata
+                    frames_read = len(block)
+                    remaining -= frames_read
+                    stop_lead_ms += (frames_read / sr * 1000)
+                    due = tracker.push(block)
+                    if writer is not None:
+                        _write(writer, due)
                     if was_holding and not tracker.holding:
                         _notify(event_q, "opened", _ms(due, sr), True,
-                                        tracker.capture_delay_ms)
-                    if pending_stop is not None:
-                        remaining -= len(indata)
-                        if remaining <= 0:
-                            tracker.end()
+                                tracker.capture_delay_ms)
+                    if remaining <= 0:
+                        tail = tracker.end(stop_lead_ms)
+                        if writer is not None:
+                            _write(writer, tail)
                             writer.close()
                             writer = None
-                            pending_stop = None
-                            _status(status_q, 'ack', request_id)
-                        else:
-                            pending_stop = (request_id, remaining)
+                        pending_stop = None
+                        _status(status_q, 'ack', request_id)
+                    else:
+                        pending_stop = (request_id, remaining, stop_lead_ms)
+                else:
+                    due = tracker.push(indata)
+                    if writer is not None:
+                        _write(writer, due)
+                        if was_holding and not tracker.holding:
+                            _notify(event_q, "opened", _ms(due, sr), True,
+                                    tracker.capture_delay_ms)
 
     except Exception as e:
         logging.error(f"Audio process fatal error: {e}")
@@ -187,6 +200,7 @@ def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
     finally:
         if writer is not None:
             try:
+                _write(writer, tracker.end())
                 writer.close()
             except Exception:
                 pass

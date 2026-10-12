@@ -24,6 +24,9 @@ _GAP_BLOCKS = 3  # ~64ms at 48kHz
 _MAX_DELAY_MS = 2000
 _DELAY_SAMPLES = 10
 
+# Audio held in memory before writing to disk, to trim boundaries at track changes
+_TAIL_MS = 2000
+
 # Slack on the clock, which can report a position its output has passed
 _CLOCK_SLACK_MS = 150
 
@@ -66,6 +69,9 @@ class BoundaryTracker:
         blocks = max(1, math.ceil(preroll_seconds * sr / BLOCKSIZE))
         self._preroll = deque(maxlen=blocks)
 
+        self._tail = deque()
+        self._tail_blocks = max(1, self._blocks(_TAIL_MS))
+
         self._open = False
         self._hold = None
 
@@ -87,6 +93,7 @@ class BoundaryTracker:
         """
         self._open = True
         self._hold = None
+        self._tail.clear()
 
         opening = self._opening_from_buffer(lead_ms)
         if opening:
@@ -107,12 +114,31 @@ class BoundaryTracker:
             return []
         if self._hold is not None:
             return self._hold_block(block)
-        return [block]
 
-    def end(self) -> None:
-        """Closes the recording. The pre-roll keeps filling."""
+        self._tail.append(block)
+        if len(self._tail) > self._tail_blocks:
+            return [self._tail.popleft()]
+        return []
+
+    def end(self, lead_ms: float = None) -> list:
+        """Closes the recording, returning the rest of it for the writer.
+        `lead_ms` is how far into the next track the source reports it, whose
+        opening is left out. The pre-roll keeps filling.
+        """
+        was_open = self._open and self._hold is None
+        tail = list(self._tail)
         self._open = False
         self._hold = None
+        self._tail.clear()
+
+        if not was_open or lead_ms is None:
+            return tail
+
+        taken = len(self._opening_from_buffer(lead_ms))
+        if taken == 0:
+            return tail
+
+        return tail[:max(0, len(tail) - taken)]
 
     # --- the opening is already in the buffer --------------------------------
 

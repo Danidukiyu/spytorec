@@ -295,6 +295,63 @@ class CaptureStartTest(unittest.TestCase):
         t0 = played + (tail_frames - BLOCKSIZE) / SR
         np.testing.assert_allclose(samples[-BLOCKSIZE:], _sweep_block(t0), atol=2e-7)
 
+    def test_transition_stop_trims_next_track_already_in_flight(self):
+        """When the next track starts playing before the stop command arrives (Issue #18),
+        none of the next track leaks into the first track, and the next track captures its opening.
+        """
+        out2 = Path(tempfile.mktemp(suffix='.flac'))
+        self.addCleanup(out2.unlink, missing_ok=True)
+
+        self._feed_blocks(_SILENCE, 0.4)
+        played = self._play(0, 1.0)
+        self._start(self._reported(played), wake_block=_sweep_block(played))
+        played += BLOCKSIZE / SR
+
+        for _ in range(int(1.0 * SR / BLOCKSIZE)):
+            self.feed.put(_sweep_block(played))
+            played += BLOCKSIZE / SR
+        self._settle()
+
+        # Track 1 ends: silence gap of 100ms (~5 blocks)
+        for _ in range(5):
+            self.feed.put(_SILENCE)
+
+        # Track 2 begins: 500ms of 3kHz tone arrives before the stop command is received
+        t2_blocks = int(0.5 * SR / BLOCKSIZE)
+        for _ in range(t2_blocks):
+            self.feed.put(_tone_block(3000))
+        self._settle()
+
+        # Stop track 1 with lead_ms ~ 500ms
+        lead_ms = (t2_blocks * BLOCKSIZE / SR) * 1000
+        self.control.put(('command', 101, time.monotonic(), ('stop', lead_ms)))
+        self.feed.put(_SILENCE)
+        self._settle()
+
+        # Start track 2 with lead_ms
+        self.control.put(('command', 102, time.monotonic(), ('start', str(out2), '24', lead_ms)))
+        self.feed.put(_SILENCE)
+        self._settle()
+
+        # Feed more of track 2
+        self._feed_blocks(_tone_block(3000), 1.0)
+
+        # Stop track 2
+        self.control.put(('command', 103, time.monotonic(), ('stop', None)))
+        self.feed.put(_SILENCE)
+        self._settle()
+
+        # Verify track 1 does not contain the 3kHz tone
+        data1, _ = sf.read(self.out)
+        tail1 = data1[-BLOCKSIZE:]
+        self.assertFalse(np.allclose(tail1, _tone_block(3000), atol=1e-3),
+                         "Track 2 audio leaked into the end of Track 1")
+
+        # Verify track 2 captured its opening
+        data2, _ = sf.read(out2)
+        head2 = data2[:BLOCKSIZE]
+        np.testing.assert_allclose(head2, _tone_block(3000), atol=1e-3)
+
     def test_writer_open_failure_is_reported_to_the_parent(self):
         with mock.patch('soundfile.SoundFile', side_effect=OSError('disk full')), \
              self.assertLogs(level='ERROR'):
