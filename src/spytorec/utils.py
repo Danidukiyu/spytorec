@@ -3,6 +3,7 @@
 import os
 import sys
 import re
+import select
 from collections import deque
 from pathlib import Path
 from contextlib import contextmanager
@@ -23,7 +24,6 @@ else:
     import fcntl
     import termios
     import tty
-    import select
     HAS_WIN32 = False
 
 
