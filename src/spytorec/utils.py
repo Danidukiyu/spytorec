@@ -46,11 +46,22 @@ def clean_filename(name: str) -> str:
     """Strips illegal filesystem characters from filenames (cross-platform safe)."""
     if not name:
         return "unknown"
-    cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]', '', str(name))
-    cleaned = cleaned.strip('. ')
-    if len(cleaned) > 200:
-        cleaned = cleaned[:200]
+    cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f]', '', str(name))
+    cleaned = cleaned[:200].strip('. ')
     return cleaned or "unknown"
+
+
+# Names Windows keeps for devices
+_RESERVED_NAMES = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$',
+                   *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}
+
+
+def unreserved(part: str) -> str:
+    """Renames a path part Windows keeps for a device."""
+    stem, dot, rest = part.partition('.')
+    if stem.rstrip(' ').upper() in _RESERVED_NAMES:
+        return f"{stem}_{dot}{rest}"
+    return part
 
 
 # Magic-byte signatures for the image formats album art actually arrives in.

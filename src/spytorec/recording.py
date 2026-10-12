@@ -1,5 +1,4 @@
-"""FFmpeg process control, file finalization, tagging, and watchdog."""
-
+import os
 import time
 import queue
 import logging
@@ -15,7 +14,34 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, TYER, TRCK, APIC
 
 from spytorec import state
-from spytorec.utils import clean_filename, fetch_image_bytes, sniff_image_mime
+from spytorec.utils import clean_filename, unreserved, fetch_image_bytes, sniff_image_mime
+
+# Windows' limit on a path
+_MAX_PATH = 259
+# Shortest a name is cut to
+_MIN_PART = 20
+# The `_<timestamp>` a name clash adds, which directories leave room for
+_CLASH = len('_1760000000')
+
+_ON_WINDOWS = os.name == 'nt'
+
+
+def fit_path(base: str, dirs: list, name: str, suffix: str) -> tuple:
+    """Cuts each directory, then the name, to fit Windows' path limits."""
+    dir_limit = _MAX_PATH - 1 - _MIN_PART - _CLASH - len(suffix)
+    used = len(base)
+    fitted = []
+    for i, part in enumerate(dirs):
+        room = dir_limit - used - 1 - (len(dirs) - 1 - i) * (_MIN_PART + 1)
+        fitted.append(_cut(part, room))
+        used += 1 + len(fitted[-1])
+    return fitted, _cut(name, _MAX_PATH - used - 1 - len(suffix))
+
+
+def _cut(part: str, room: int) -> str:
+    if len(part) <= room:
+        return part
+    return part[:max(_MIN_PART, room)].rstrip('. ')
 
 
 def get_final_path(out_dir: Path, track_info: Dict, naming_format: str,
@@ -36,11 +62,11 @@ def get_final_path(out_dir: Path, track_info: Dict, naming_format: str,
 
     organize_by = cfg['Naming'].get('organize_by', 'none').lower()
     if organize_by == 'artist/album':
-        target_dir = out_dir / artist / album
+        dirs = [artist, album]
     elif organize_by == 'artist':
-        target_dir = out_dir / artist
+        dirs = [artist]
     else:
-        target_dir = out_dir
+        dirs = []
 
     try:
         final_name = naming_format.format(**tags)
@@ -48,8 +74,14 @@ def get_final_path(out_dir: Path, track_info: Dict, naming_format: str,
         logging.warning(f"Missing tag in naming format: {e}, using fallback")
         final_name = f"{track_no}. {artist} - {title}"
 
-    final_name = clean_filename(final_name)
-    final_path = target_dir / f"{final_name}.{output_format}"
+    final_name = unreserved(clean_filename(final_name))
+    dirs = [unreserved(d) for d in dirs]
+    suffix = f".{output_format}"
+    if _ON_WINDOWS:
+        dirs, final_name = fit_path(str(out_dir), dirs, final_name, suffix)
+
+    target_dir = out_dir.joinpath(*dirs)
+    final_path = target_dir / f"{final_name}{suffix}"
 
     return target_dir, final_path
 
@@ -77,7 +109,11 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
         # Handle existing files
         if final_path.exists():
             if not cfg['Recording'].getboolean('overwrite_existing'):
-                final_path = target_dir / f"{final_path.stem}_{uuid.uuid4().hex}.{output_format}"
+                suffix = f"_{int(time.time())}.{output_format}"
+                stem = final_path.stem
+                if _ON_WINDOWS:
+                    _, stem = fit_path(str(target_dir), [], stem, suffix)
+                final_path = target_dir / f"{stem}{suffix}"
                 logging.info(f"File exists, created: {final_path.name}")
             else:
                 logging.info(f"Overwriting existing file: {final_path.name}")
@@ -150,8 +186,23 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
 
     except Exception as e:
         logging.exception(f"Finalise Error: {e}")
+        try:
+            if temp_file and temp_file.exists():
+                stem = temp_file.stem
+                if stem.startswith('.tmp_'):
+                    unsaved_name = f"Unsaved_{stem[5:]}{temp_file.suffix}"
+                elif stem.startswith('.tmp'):
+                    unsaved_name = f"Unsaved_{stem[4:]}{temp_file.suffix}"
+                else:
+                    unsaved_name = f"Unsaved_{stem}{temp_file.suffix}"
+                kept = out_dir / unsaved_name
+                temp_file.replace(kept)
+                logging.warning(f"Kept the recording as {kept}")
+                return {'ok': False, 'error': str(e), 'recovery_path': str(kept.resolve())}
+        except Exception as keep_err:
+            logging.warning(f"Could not preserve recording as Unsaved: {keep_err}")
         return {'ok': False, 'error': str(e),
-                'recovery_path': str(temp_file.resolve())}
+                'recovery_path': str(temp_file.resolve()) if temp_file and temp_file.exists() else None}
     finally:
         if tagged_file is not None:
             try:

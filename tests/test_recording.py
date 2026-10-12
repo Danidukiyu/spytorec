@@ -45,9 +45,10 @@ class FinalizeTests(unittest.TestCase):
              self.assertLogs(level='ERROR'):
             result = self.save()
         self.assertFalse(result['ok'])
-        self.assertEqual(result['recovery_path'], str(self.path.resolve()))
+        recovery = Path(result['recovery_path'])
+        self.assertTrue(recovery.exists())
         self.assertIn('disk full', result['error'])
-        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(recovery.read_bytes(), before)
 
     def test_move_failure_preserves_the_original_readable_audio(self):
         before = self.path.read_bytes()
@@ -68,7 +69,8 @@ class FinalizeTests(unittest.TestCase):
              self.assertLogs(level='ERROR'):
             result = self.save()
         self.assertFalse(result['ok'])
-        self.assertEqual(self.path.read_bytes(), before)
+        recovery = Path(result['recovery_path'])
+        self.assertEqual(recovery.read_bytes(), before)
         self.assertFalse(list(self.root.glob('.tmp_tag_*')))
 
     def test_small_recording_is_retained_for_inspection(self):
