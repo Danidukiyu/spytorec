@@ -16,12 +16,13 @@ import numpy as np
 # Frames per captured block. Also the granularity of the pre-roll buffer.
 BLOCKSIZE = 1024
 
-# A gap between tracks is digital silence; a quiet fade-in stays above -80 dBFS
-_SILENCE_RMS = 0.0001
+# A gap between tracks is digital silence; fade-ins and room tone dip below -100 dBFS
+_SILENCE_PEAK = 1e-6  # -120 dBFS
 _GAP_BLOCKS = 3  # ~64ms at 48kHz
 
 # Ceiling on how long a recording waits for its boundary.
 _MAX_DELAY_MS = 2000
+_DELAY_SAMPLES = 10
 
 # Slack on the clock, which can report a position its output has passed
 _CLOCK_SLACK_MS = 150
@@ -59,6 +60,7 @@ class BoundaryTracker:
         self._block_ms = BLOCKSIZE / sr * 1000
         self._preroll_seconds = preroll_seconds
         self._capture_delay_ms = min(capture_delay_ms, _MAX_DELAY_MS)
+        self._delays = deque([self._capture_delay_ms] * 2, maxlen=_DELAY_SAMPLES)
         self._boundary_window_ms = boundary_window_ms
 
         blocks = max(1, math.ceil(preroll_seconds * sr / BLOCKSIZE))
@@ -94,6 +96,7 @@ class BoundaryTracker:
         predicted_ms = max(0.0, self._capture_delay_ms - lead_ms)
         self._hold = _Hold(lead_ms, self._blocks(predicted_ms),
                            self._blocks(self._boundary_window_ms))
+        self._hold.run = _silent_run(self._preroll)
         return [], True
 
     def push(self, block: np.ndarray) -> list:
@@ -122,6 +125,10 @@ class BoundaryTracker:
             return []
 
         cut = _first_gap_end(window)
+
+        if cut is None and _silent_run(window) >= _GAP_BLOCKS:
+            # A gap still under way: the track opens where it ends
+            return []
 
         if cut is None:
             # No gap: the clock places the boundary
@@ -159,11 +166,19 @@ class BoundaryTracker:
             gap_end = index if hold.run >= _GAP_BLOCKS else None
             hold.run = 0
 
-        if gap_end is not None and abs(gap_end - hold.target) <= hold.window:
+        if gap_end is not None and (hold.overran or abs(gap_end - hold.target) <= hold.window):
             # The gap the clock predicted: the track opens here
             self._learn_delay(hold.lead_ms + gap_end * self._block_ms)
             logging.debug(f"Opened on a gap {gap_end - hold.target} blocks from the estimate")
             opening = hold.blocks[gap_end:]
+        elif index >= hold.target + hold.window and hold.run >= _GAP_BLOCKS:
+            # A gap under way: the track opens where it ends
+            hold.overran = True
+            hold.blocks.clear()
+            return []
+        elif index >= hold.target + hold.window and hold.run > 0:
+            # Possibly a gap starting; wait to see
+            return []
         elif index >= hold.target + hold.window:
             # No gap within the window: the clock places the opening
             logging.debug("No gap near the estimate; opening where the clock says")
@@ -175,21 +190,23 @@ class BoundaryTracker:
         return opening
 
     def _learn_delay(self, observed_ms: float) -> None:
-        """Folds an observed boundary into the estimate; past the ceiling it is discarded."""
+        """Adds an observed boundary to the estimate; past the ceiling it is discarded."""
         if observed_ms > _MAX_DELAY_MS:
             return
 
-        self._capture_delay_ms = (self._capture_delay_ms + max(observed_ms, 0.0)) / 2
+        self._delays.append(max(observed_ms, 0.0))
+        self._capture_delay_ms = float(np.median(self._delays))
 
 
 class _Hold:
     """Audio held by a recording whose boundary has yet to arrive."""
 
-    __slots__ = ('blocks', 'run', 'lead_ms', 'target', 'window')
+    __slots__ = ('blocks', 'run', 'overran', 'lead_ms', 'target', 'window')
 
     def __init__(self, lead_ms: float, target: int, window: int):
         self.blocks = []
         self.run = 0
+        self.overran = False
         self.lead_ms = lead_ms
         self.target = target
         self.window = window
@@ -210,6 +227,16 @@ def _first_gap_end(chunks: list):
     return None
 
 
+def _silent_run(chunks) -> int:
+    """How many silent blocks `chunks` ends with."""
+    run = 0
+    for chunk in reversed(chunks):
+        if not _is_silent(chunk):
+            break
+        run += 1
+    return run
+
+
 def _without_leading_silence(chunks: list) -> list:
     i = 0
     while i < len(chunks) and _is_silent(chunks[i]):
@@ -219,6 +246,6 @@ def _without_leading_silence(chunks: list) -> list:
 
 def _is_silent(block: np.ndarray) -> bool:
     try:
-        return bool(np.sqrt(np.mean(block ** 2)) < _SILENCE_RMS)
+        return bool(np.max(np.abs(block)) < _SILENCE_PEAK)
     except Exception:
         return False

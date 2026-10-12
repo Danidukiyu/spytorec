@@ -43,16 +43,73 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(written, 0, 'released on a gap nowhere near the estimate')
         self.assertTrue(self.tracker.holding)
 
-    # --- the estimate corrects itself -------------------------------------
+    def test_a_gap_running_past_the_window_opens_where_it_ends(self):
+        """The window closes mid-gap: no silence is written ahead of the track."""
+        self._fill(40, level=0.4)
+        self.tracker.begin(0)                         # boundary predicted ~600ms out
 
-    def test_a_boundary_found_late_moves_the_estimate_out(self):
+        written = []
+        for level in [0.0] * 120 + [0.5] * 4:         # a 2.5s gap
+            written += self.tracker.push(_block(level))
+
+        self.assertEqual(len(written), 4, 'wrote the gap')
+        self.assertGreater(min(np.min(b) for b in written), 0.0)
+
+    def test_a_short_silence_at_the_window_edge_is_not_a_gap(self):
+        self._fill(40, level=0.4)
+        self.tracker.begin(0)
+        edge = round(600 / BLOCK_MS) + round(800 / BLOCK_MS)
+
+        written = self._feed_held([0.4] * edge + [0.0] * 2 + [0.5] * 4)
+
+        self.assertGreater(written, 4, 'held past a short silence')
+
+    # --- a quiet fade-in is part of the track -----------------------------
+
+    def test_a_quiet_fade_in_in_the_buffer_is_kept(self):
+        """A -90 dBFS opening is the track, not the gap before it."""
+        self._fill(10, level=0.4)
+        self._fill(6, level=0.0)
+        self._fill(3, level=3e-5)
+        self._fill(23, level=0.5)
+
+        opening, holding = self.tracker.begin(20 * BLOCK_MS + self.tracker.capture_delay_ms)
+
+        self.assertFalse(holding)
+        self.assertEqual(len(opening), 26, 'trimmed the fade-in')
+
+    def test_a_quiet_fade_in_after_a_held_gap_is_kept(self):
         self._fill(40, level=0.4)
         self.tracker.begin(200)
+
+        written = self._feed_held([0.4] * 16 + [0.0] * 4 + [3e-5] * 3 + [0.5] * 4)
+
+        self.assertEqual(written, 7, 'trimmed the fade-in')
+
+    # --- the estimate corrects itself -------------------------------------
+
+    def _late_boundary(self, late_blocks: int) -> None:
+        """One recording held for a boundary `late_blocks` past the estimate."""
+        self._fill(40, level=0.4)
+        self.tracker.begin(200)
+        target = round((self.tracker.capture_delay_ms - 200) / BLOCK_MS)
+        self._feed_held([0.4] * (target + late_blocks - 5) + [0.0] * 5 + [0.5] * 4)
+
+    def test_boundaries_found_late_move_the_estimate_out(self):
         before = self.tracker.capture_delay_ms
 
-        self._feed_held([0.4] * 18 + [0.0] * 5 + [0.5] * 4)
+        self._late_boundary(10)
+        self._late_boundary(10)
 
         self.assertGreater(self.tracker.capture_delay_ms, before)
+
+    def test_one_late_boundary_leaves_the_estimate_alone(self):
+        """A single outlier is not the delay."""
+        before = self.tracker.capture_delay_ms
+
+        self._late_boundary(30)
+
+        self.assertEqual(self.tracker.capture_delay_ms, before)
 
     def test_a_gap_already_in_the_buffer_leaves_the_estimate_alone(self):
         """Only a boundary waited for measures the delay."""
