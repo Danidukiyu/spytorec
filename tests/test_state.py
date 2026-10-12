@@ -1,6 +1,7 @@
 """Tests for the application state machine."""
 
 import unittest
+from unittest import mock
 
 from spytorec import state
 
@@ -33,6 +34,12 @@ class StateTransitionTest(unittest.TestCase):
         with self.assertNoLogs(level='WARNING'):
             self.assertFalse(state.set_state(state.STATE_RECORDING))
         self.assertEqual(state.get_state(), state.STATE_RECORDING)
+
+    def test_error_handler_leaves_recovery_to_the_recording_lifecycle(self):
+        self._walk(state.STATE_MONITORING, state.STATE_RECORDING)
+        with mock.patch.object(state.stop_event, 'wait'):
+            state.handle_error_recovery(RuntimeError('capture failed'), 0, 2)
+        self.assertEqual(state.get_state(), state.STATE_ERROR)
 
 
 if __name__ == '__main__':

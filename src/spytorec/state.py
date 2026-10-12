@@ -106,14 +106,11 @@ def get_state() -> str:
 
 
 def handle_error_recovery(error, last_error_time, error_recovery_delay):
-    """Common error recovery logic for main loop exception handlers."""
+    """Request recovery; the main loop owns stopping and restarting capture."""
+    set_state(STATE_ERROR, str(error))
     if time.time() - last_error_time > error_recovery_delay:
-        set_state(STATE_ERROR, str(error))
-        time.sleep(5)
-        set_state(STATE_RECOVERING)
-        time.sleep(2)
-        set_state(STATE_MONITORING)
+        stop_event.wait(error_recovery_delay)
         return time.time()
     else:
-        time.sleep(1)
+        stop_event.wait(1)
         return last_error_time

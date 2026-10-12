@@ -17,7 +17,7 @@
 
 ## ✨ Features
 
-- 🎵 Real-Time Recording (FLAC or OGG/MP3)
+- 🎵 Real-Time Recording (native FLAC)
 - 🎯 Zero-API Track Monitoring (via OS Media Events)
 - ⏪ Boundary Tracking: opens each recording on the track's first beat, however late the change is reported
 - 🔌 Zero-Config Audio Capture (WASAPI Loopback - No Virtual Cables needed!)
@@ -52,7 +52,7 @@ SpytoRec v8.1.0+ is now an installable Python package.
    ```
 
 > [!NOTE]
-> **Optional (MP3 Encoding):** Native recording defaults to FLAC. If you want to save as `.mp3`, you must install **FFmpeg** and add it to your `PATH`.
+> **Output format:** The current capture pipeline saves FLAC. An `output_format = mp3` setting prints a notice and uses FLAC for filenames, metadata, duplicate detection, and the session display. MP3 encoding is not yet connected to this pipeline.
 
 ---
 
@@ -125,11 +125,12 @@ spytorec --help
 
 ## 📁 Output Features
 
-- Tracks saved in chosen format and directory
+- Tracks saved as FLAC in the chosen directory
 - FLAC includes embedded album art
 - Duplicate checking by track ID and filename
 - Metadata includes artist, album, and title
-- Rewrites headers using FFmpeg post-recording
+- Closes native FLAC files before embedding metadata
+- Failed saves retain the temporary audio and print its recovery path
 
 ---
 
@@ -142,7 +143,7 @@ spytorec --help
 | Beginning cut off           | Raise `preroll_seconds` in config.ini (default 5) - how much played audio is kept to open a recording with |
 | Previous track bleeding in  | Lower `capture_delay_ms` (default 600) - how long the previous track keeps draining after Spotify reports the change - or narrow `boundary_window_ms` (default 800) |
 | Recording is far too quiet  | macOS: the system slider attenuates the loopback itself. SpytoRec pins it to unity gain - set `force_unity_gain = false` in config.ini to opt out |
-| Corrupted duration          | Ensure `ffmpeg` finalizer runs successfully                       |
+| Failed save                 | The recovery path is printed; keep that file for manual recovery or retry |
 | Ads in recording            | Use Spotify Premium  (eventhough Ads won't recorded in Free Subscriptions)                                              |
 
 ---

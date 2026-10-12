@@ -4,7 +4,9 @@ import time
 import queue
 import logging
 import threading
-import subprocess
+import shutil
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Dict
 
@@ -58,18 +60,16 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
     Returns a dict with 'ok': bool, 'size_mb': float, 'path': str on success.
     """
     if not temp_file or not temp_file.exists():
-        return {'ok': False}
+        return {'ok': False, 'error': 'Recording file is missing'}
 
+    tagged_file = None
     try:
         # Verify file integrity
         if cfg['SafetyChecks'].getboolean('validate_file_integrity'):
             if temp_file.stat().st_size < 8192:
                 logging.warning(f"File too small, possible corruption: {temp_file}")
-                temp_file.unlink()
-                return {'ok': False}
-
-        # Wait a moment for file to be fully written
-        time.sleep(1.5)
+                return {'ok': False, 'error': 'Recording is too small to validate',
+                        'recovery_path': str(temp_file.resolve())}
 
         target_dir, final_path = get_final_path(out_dir, track_info, naming_format, output_format, cfg)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -77,8 +77,7 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
         # Handle existing files
         if final_path.exists():
             if not cfg['Recording'].getboolean('overwrite_existing'):
-                timestamp = int(time.time())
-                final_path = target_dir / f"{final_path.stem}_{timestamp}.{output_format}"
+                final_path = target_dir / f"{final_path.stem}_{uuid.uuid4().hex}.{output_format}"
                 logging.info(f"File exists, created: {final_path.name}")
             else:
                 logging.info(f"Overwriting existing file: {final_path.name}")
@@ -86,8 +85,14 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
         year = track_info['album'].get('release_date', '0000')[:4]
         track_no = str(track_info.get('track_number', 0)).zfill(2)
 
+        # Tag a copy: a failed in-place metadata write can damage the source.
+        with tempfile.NamedTemporaryFile(prefix='.tmp_tag_', suffix=f'.{output_format}',
+                                         dir=temp_file.parent, delete=False) as staged:
+            tagged_file = Path(staged.name)
+        shutil.copyfile(temp_file, tagged_file)
+
         if output_format == 'mp3':
-            audio = MP3(temp_file, ID3=ID3)
+            audio = MP3(tagged_file, ID3=ID3)
             if audio.tags is None:
                 audio.add_tags()
             audio.tags.add(TIT2(encoding=3, text=track_info['name']))
@@ -96,7 +101,7 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
             audio.tags.add(TYER(encoding=3, text=year))
             audio.tags.add(TRCK(encoding=3, text=track_no))
         else:
-            audio = FLAC(temp_file)
+            audio = FLAC(tagged_file)
             audio['title'] = track_info['name']
             audio['artist'] = track_info['artists'][0]['name']
             audio['album'] = track_info['album']['name']
@@ -134,19 +139,25 @@ def finalize(temp_file: Path, out_dir: Path, track_info: Dict,
         audio.save()
 
         # Move to final location
-        temp_file.replace(final_path)
+        tagged_file.replace(final_path)
         size_mb = round(final_path.stat().st_size / (1024 ** 2), 2)
+        try:
+            temp_file.unlink()
+        except OSError as e:
+            logging.warning(f'Saved recording, but could not remove original {temp_file}: {e}')
         logging.info(f"Finalised: {final_path.name}")
         return {'ok': True, 'size_mb': size_mb, 'path': str(final_path.name)}
 
     except Exception as e:
         logging.exception(f"Finalise Error: {e}")
-        try:
-            if temp_file and temp_file.exists():
-                temp_file.unlink()
-        except Exception:
-            pass
-        return {'ok': False}
+        return {'ok': False, 'error': str(e),
+                'recovery_path': str(temp_file.resolve())}
+    finally:
+        if tagged_file is not None:
+            try:
+                tagged_file.unlink(missing_ok=True)
+            except OSError as e:
+                logging.warning(f'Could not remove staging file {tagged_file}: {e}')
 
 
 # safely_stop_ffmpeg removed, handled by writers.py
@@ -253,6 +264,7 @@ class BackgroundFinalizer:
                 result = self._finalize_track(track, temp_file)
             except Exception as e:
                 logging.exception(f"Finalise failed for {track.get('name')}: {e}")
-                result = {'ok': False, 'size_mb': 0}
+                result = {'ok': False, 'size_mb': 0, 'error': str(e),
+                          'recovery_path': str(Path(temp_file).resolve())}
 
             self._results.put((track, result))

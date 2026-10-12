@@ -1,12 +1,10 @@
 """SpytoRec CLI entry point — main recording engine."""
 
-import os
 import sys
 import time
 import signal
 import atexit
 import argparse
-import subprocess
 import threading
 import logging
 import warnings
@@ -25,9 +23,9 @@ from spytorec import state, coreaudio
 from spytorec.config import load_config, setup_logging, console
 from spytorec.utils import resolve_path, KBHit, LOCK_FILE_PATH
 from spytorec.audio_process import (
-    start_audio_process, start_recording, stop_recording,
-    shutdown_audio_process, read_meters, read_events, is_audio_alive, find_device
+    shutdown_audio_process, read_meters, read_events, check_audio_health, find_device
 )
+from spytorec.session import RecordingSession, effective_output_format, playback_lead_ms
 from spytorec.boundary import settings_from_config
 from spytorec.recording import (
     get_final_path, finalize, watchdog_worker, BackgroundFinalizer
@@ -36,10 +34,9 @@ from spytorec.spotify.selector import get_source
 from spytorec.blocklist import load_blocklist, is_track_blocked
 from spytorec.webhooks import send_webhook
 from spytorec.hardware import discover_hardware
-from spytorec.writers import FFmpegMp3Writer
 from spytorec.ui import (
     build_dashboard, build_history_table,
-    SP_GREEN, SP_GREEN_DIM, SP_GREY, SP_DARK
+    SP_GREEN, SP_GREEN_DIM, SP_GREY
 )
 
 
@@ -70,8 +67,6 @@ def signal_handler(signum, frame):
 
 
 def main():
-    global cfg
-
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -97,9 +92,10 @@ def main():
     # Setup directories
     out_dir = resolve_path(cfg['Recording'].get('output_directory', 'Recordings'))
     naming_format = cfg['Naming'].get('naming_format', '{track_no}. {artist} - {title}')
-    output_format = cfg['Recording'].get('output_format', 'flac').lower()
-    if output_format not in ['flac', 'mp3']:
-        output_format = 'flac'
+    requested_format = cfg['Recording'].get('output_format', 'flac')
+    output_format = effective_output_format(requested_format)
+    if requested_format.lower() == 'mp3':
+        console.print('[yellow]MP3 capture is unavailable. Saving this session as FLAC.[/yellow]')
 
     # Validate output directory
     try:
@@ -170,22 +166,9 @@ def main():
     watchdog_thread = threading.Thread(target=watchdog_worker, args=(cfg,), daemon=True)
     watchdog_thread.start()
 
-    # Setup FFmpeg logging
-    ff_log_ptr = subprocess.DEVNULL
-    ff_log_file = None
-
-    if cfg['Diagnostics'].getboolean('enable_logging'):
-        ff_log_file = resolve_path(cfg['Diagnostics'].get('ffmpeg_log_file', 'spyto_ffmpeg.log'))
-        try:
-            ff_log_ptr = open(ff_log_file, "a", encoding='utf-8')
-        except Exception as e:
-            logging.warning(f"Could not open FFmpeg log file: {e}")
-            ff_log_ptr = subprocess.DEVNULL
-
     # Main loop variables
     current_track = None
     current_id = None
-    temp_file = None
     last_error_time = 0
     error_recovery_delay = 2
     last_file_size_check = 0
@@ -212,9 +195,13 @@ def main():
     finalizer = BackgroundFinalizer(finalize_track)
     finalizer.start()
 
-    def save_current(track, tmp):
-        """Hands a finished recording to the finaliser thread."""
-        finalizer.submit(track, tmp)
+    def report_failure(track, recovery_path, error):
+        track_history.append({'name': track['name'], 'artist': track['artists'][0]['name'],
+                              'size': 0, 'status': 'fail'})
+        state.failed_recordings.append(track['name'])
+        console.print(f"\u2717 Failed: {track['name']} ({error})", style='red', markup=False)
+        if recovery_path:
+            console.print(f'Recording retained: {recovery_path}', markup=False)
 
     def drain_results():
         """Applies finished saves to the session tally and history."""
@@ -231,10 +218,8 @@ def main():
                 logging.info(f"Saved: {track['name']}")
                 console.print(f"[green]\u2713 Saved: {track['name']}[/green]")
             else:
-                track_history.append({'name': track['name'], 'artist': artist,
-                                      'size': 0, 'status': 'fail'})
-                state.failed_recordings.append(track['name'])
-                console.print(f"[red]\u2717 Failed to save: {track['name']}[/red]")
+                report_failure(track, result.get('recovery_path'),
+                               result.get('error', 'Could not save recording'))
 
     # Initialize recording params
     sr = int(cfg['Recording'].get('sample_rate', '48000'))
@@ -257,12 +242,15 @@ def main():
             logging.info(f"Capture gain: '{hw_name}' {change}")
             console.print(f"[yellow]Capture gain corrected: '{hw_name}' {change}[/yellow]")
 
-    start_audio_process(hw_idx, sr, ch, smooth_meter, hw_name, settings_from_config(cfg))
-
-    state.set_state(state.STATE_MONITORING)
-    last_poll_done = time.monotonic()
+    session = RecordingSession(out_dir, {
+        'mic_id': hw_idx, 'sr': sr, 'ch': ch, 'smooth_meter': smooth_meter,
+        'mic_name': hw_name, 'boundary': settings_from_config(cfg),
+    }, finalizer.submit, report_failure)
 
     try:
+        session.start_pipeline()
+        state.set_state(state.STATE_MONITORING)
+        last_poll_done = time.monotonic()
         with Live(Panel(Text("Waiting for Spotify...", style="yellow")), refresh_per_second=10) as live:
             while not state.stop_event.is_set():
                 try:
@@ -283,21 +271,16 @@ def main():
                     # Check for error state set by watchdog and recover
                     if state.get_state() == state.STATE_ERROR:
                         logging.info("Main loop detected error state, attempting recovery...")
-                        stop_recording()
-                        state.is_recording = False
-                        if temp_file and temp_file.exists():
-                            try:
-                                temp_file.unlink()
-                            except Exception:
-                                pass
-                        temp_file = None
                         current_track = None
                         current_id = None
                         state.current_track_id_ref = None
                         state.set_state(state.STATE_RECOVERING)
-                        time.sleep(2)
+                        session.recover()
                         state.set_state(state.STATE_MONITORING)
+                        last_poll_done = time.monotonic()
                         continue
+
+                    check_audio_health()
 
                     # File anything the finaliser thread has completed
                     drain_results()
@@ -315,18 +298,11 @@ def main():
 
                         # Handle track change
                         if track_id != current_id:
+                            lead_ms = playback_lead_ms(playback, poll_started, poll_gap_ms)
                             # Stop current recording if any
                             if state.is_recording:
                                 state.set_state(state.STATE_SWITCHING)
-                                stop_recording()
-                                state.is_recording = False
-
-                                # Give the audio process a moment to finalize the FLAC
-                                time.sleep(0.1)
-
-                                if temp_file and current_track:
-                                    save_current(current_track, temp_file)
-                                    temp_file = None
+                                session.finish_track(lead_ms)
 
                             # Check for duplicates before starting recording
                             _, predicted_path = get_final_path(out_dir, track, naming_format, output_format, cfg)
@@ -342,7 +318,6 @@ def main():
                                 current_track = track
                                 current_id = track_id
                                 state.current_track_id_ref = track_id
-                                temp_file = None
                                 continue
 
                             # 2. Check duplicate
@@ -354,33 +329,15 @@ def main():
                                 current_track = track
                                 current_id = track_id
                                 state.current_track_id_ref = track_id
-                                temp_file = None
                                 continue
 
                             # Start new recording
                             bit_depth = cfg['Recording'].get('bit_depth', '24')
 
-                            # How far into the track the source reports it.
-                            # progress_ms measures this; the poll gap bounds it,
-                            # and stands in for sources that step or omit it.
-                            progress_ms = playback.get('progress_ms', 0)
-                            lead_ms = (progress_ms or poll_gap_ms) + \
-                                (time.monotonic() - poll_started) * 1000
-
-                            # Named by nanosecond: two recordings can start within a second
-                            temp_file = out_dir / f".tmp_{time.time_ns()}.{output_format}"
+                            lead_ms = playback_lead_ms(playback, poll_started, poll_gap_ms)
 
                             try:
-                                if output_format == 'mp3':
-                                    # MP3 still uses FFmpeg (no native encoder)
-                                    # TODO: Route MP3 through audio_process or keep FFmpeg fallback
-                                    logging.warning("MP3 format not yet supported with new pipeline, falling back to FLAC")
-
-                                # Send start command to the audio process
-                                start_recording(temp_file, bit_depth, lead_ms)
-                                state.is_recording = True
-
-                                state.watchdog_file_ref = temp_file
+                                session.start_track(track, bit_depth, lead_ms)
                                 current_track = track
                                 current_id = track_id
                                 state.current_track_id_ref = track_id
@@ -393,20 +350,14 @@ def main():
 
                             except Exception as e:
                                 logging.error(f"Failed to start recording: {e}")
-                                if temp_file and temp_file.exists():
-                                    try:
-                                        temp_file.unlink()
-                                    except Exception:
-                                        pass
-                                temp_file = None
                                 state.set_state(state.STATE_ERROR, f"Recording error: {e}")
                                 continue
 
                         # Build UI display
                         now = time.time()
                         if now - last_file_size_check > 1.0:
-                            if temp_file and temp_file.exists():
-                                cached_file_size = round(temp_file.stat().st_size / (1024 ** 2), 2)
+                            if session.path and session.path.exists():
+                                cached_file_size = round(session.path.stat().st_size / (1024 ** 2), 2)
                             else:
                                 cached_file_size = 0.0
                             last_file_size_check = now
@@ -423,14 +374,7 @@ def main():
                         # Not playing - cleanup if needed
                         if state.is_recording:
                             state.set_state(state.STATE_STOPPING)
-                            stop_recording()
-                            state.is_recording = False
-                            time.sleep(0.1)
-
-                            if temp_file and current_track:
-                                save_current(current_track, temp_file)
-
-                            temp_file = None
+                            session.finish_track(lead_ms=0)
                             current_track = None
                             current_id = None
                             state.current_track_id_ref = None
@@ -472,14 +416,7 @@ def main():
                                 console.print(f"[yellow]Skipped & blocklisted: {track_name}[/yellow]")
                             except Exception as e:
                                 logging.error(f"Failed to update blocklist: {e}")
-                            stop_recording()
-                            state.is_recording = False
-                            if temp_file and temp_file.exists():
-                                try:
-                                    temp_file.unlink()
-                                except Exception:
-                                    pass
-                            temp_file = None
+                            session.finish_track(discard=True)
                             track_history.append({'name': track_name, 'artist': current_track['artists'][0]['name'], 'size': 0, 'status': 'skip'})
                             state.set_state(state.STATE_SKIPPED)
                             current_track = None
@@ -503,28 +440,16 @@ def main():
     finally:
         # Finalise a recording still in progress at shutdown (e.g. 'q' mid-track),
         # otherwise its .tmp file is left untagged and unnamed.
+        state.stop_event.set()
         if state.is_recording:
-            # Leaves RECORDING, which the watchdog checks the process under
             state.set_state(state.STATE_STOPPING)
-            stop_recording()
-            state.is_recording = False
-            time.sleep(0.2)  # Give audio process time to finalize FLAC
-        shutdown_audio_process()
-        if temp_file and current_track and temp_file.exists():
-            save_current(current_track, temp_file)
-            temp_file = None
+        session.shutdown()
 
         # Queued saves finish before the summary counts them
         if finalizer.busy:
             console.print("[yellow]Finishing pending saves...[/yellow]")
         finalizer.close()
         drain_results()
-
-        if ff_log_ptr != subprocess.DEVNULL:
-            try:
-                ff_log_ptr.close()
-            except Exception:
-                pass
 
         try:
             source.close()

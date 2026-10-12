@@ -7,6 +7,7 @@ __pycache__/
 *.env
 env/
 venv/
+.venv/
 ENV/
 # Distribution / packaging
 .Python
@@ -53,3 +54,10 @@ spyto.lock
 .DS_Store
 *.sublime-project
 *.sublime-workspace
+
+# Local review and test scratch artifacts
+.review/
+.cache
+pipeline_long.flac
+/test_*.py
+fetch_issue_details.py

@@ -5,12 +5,14 @@ finished file says where the recording opened.
 """
 
 import sys
+import time
 import queue
 import shutil
 import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -100,11 +102,12 @@ class CaptureStartTest(unittest.TestCase):
 
         self.control = queue.Queue()
         self.events = queue.Queue()
+        self.status = queue.Queue()
         self.worker = threading.Thread(
             target=audio_process._audio_worker,
             args=(self.control, queue.Queue(), self.events, 'fake', SR, CH, False),
             kwargs={'boundary': {'preroll_seconds': 5.0, 'capture_delay_ms': DELAY_MS,
-                                 'boundary_window_ms': 800}},
+                                 'boundary_window_ms': 800}, 'status_q': self.status},
             daemon=True)
         self.worker.start()
         self.addCleanup(self._shutdown)
@@ -138,14 +141,17 @@ class CaptureStartTest(unittest.TestCase):
 
     def _settle(self) -> None:
         """Waits for the worker to have consumed everything fed so far."""
+        deadline = time.monotonic() + 5
         while not self.feed.empty():
+            if time.monotonic() > deadline:
+                self.fail('Audio worker did not consume test audio')
             threading.Event().wait(0.01)
         threading.Event().wait(0.05)
 
-    def _start(self, lead_ms: float) -> None:
+    def _start(self, lead_ms: float, wake_block=None) -> None:
         """Starts a recording; one more block lets the worker read the command."""
         self.control.put(("start", str(self.out), '24', lead_ms))
-        self.feed.put(_SILENCE)
+        self.feed.put(_SILENCE if wake_block is None else wake_block)
         self._settle()
 
     def _stop(self) -> Path:
@@ -254,13 +260,93 @@ class CaptureStartTest(unittest.TestCase):
         self.assertAlmostEqual(self._started_at(out), LATE_S + DELAY_MS / 1000, delta=0.05)
 
     def test_a_recording_stopped_while_holding_is_empty(self):
-        """Small enough for finalize's size check to discard."""
+        """Small enough for finalize's size check to reject."""
         self._feed_blocks(_tone_block(3000), 1.0)
 
         self._start(200)
         out = self._stop()
 
         self.assertLess(out.stat().st_size, 8192)
+
+    def test_delayed_stop_preserves_the_tail_without_recording_the_next_track(self):
+        self._feed_blocks(_SILENCE, 0.4)
+        played = self._play(0, 1.0)
+        self._start(self._reported(played), wake_block=_sweep_block(played))
+        played += BLOCKSIZE / SR
+        # The player has changed tracks, but 400ms of the old audio is still in flight.
+        tail_frames = int(0.4 * SR)
+        self.control.put(('stop', 200))
+        # The worker is already blocked in record(): this block precedes the stop command.
+        self.feed.put(_sweep_block(played))
+        self._settle()
+        played += BLOCKSIZE / SR
+        for i in range(int(np.ceil(tail_frames / BLOCKSIZE))):
+            block = _sweep_block(played + i * BLOCKSIZE / SR)
+            remaining = max(0, tail_frames - i * BLOCKSIZE)
+            if remaining < BLOCKSIZE:
+                block[remaining:] = _tone_block(3000)[remaining:]
+            self.feed.put(block)
+        self._settle()
+        self._feed_blocks(_tone_block(3000), 0.5)
+        self._shutdown()
+        self.assertEqual(sf.info(self.out).frames, round(played * SR) + tail_frames)
+        samples, _ = sf.read(self.out)
+        # The last samples are still the old sweep, not the 3kHz next track.
+        t0 = played + (tail_frames - BLOCKSIZE) / SR
+        np.testing.assert_allclose(samples[-BLOCKSIZE:], _sweep_block(t0), atol=2e-7)
+
+    def test_writer_open_failure_is_reported_to_the_parent(self):
+        with mock.patch('soundfile.SoundFile', side_effect=OSError('disk full')), \
+             self.assertLogs(level='ERROR'):
+            self._start(0)
+            self.worker.join(timeout=2)
+        replies = list(self.status.queue)
+        self.assertTrue(any(kind == 'ack' and 'disk full' in (error or '')
+                            for kind, _, error in replies))
+        self.assertFalse(self.worker.is_alive())
+
+    def test_stop_confirmation_waits_for_writer_close(self):
+        real_soundfile = sf.SoundFile
+        closing_started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        def writer(**kwargs):
+            real = real_soundfile(**kwargs)
+            wrapped = mock.Mock(wraps=real)
+            def close():
+                closing_started.set()
+                release.wait(3)
+                real.close()
+            wrapped.close.side_effect = close
+            return wrapped
+        self._feed_blocks(_SILENCE, 0.4)
+        played = self._play(0, 1.0)
+        with mock.patch('soundfile.SoundFile', side_effect=writer):
+            self._start(self._reported(played))
+            self.control.put(('command', 99, time.monotonic(), ('stop', None)))
+            self.feed.put(_SILENCE)
+            self.assertTrue(closing_started.wait(2))
+            self.assertFalse(any(kind == 'ack' and rid == 99
+                                 for kind, rid, _ in list(self.status.queue)))
+            release.set()
+            self._settle()
+        self.assertIn(('ack', 99, None), list(self.status.queue))
+        self.assertGreater(sf.info(self.out).frames, 0)
+
+    def test_recording_write_failure_stops_capture_and_reports_an_error(self):
+        real_soundfile = sf.SoundFile
+        def writer(**kwargs):
+            wrapped = mock.Mock(wraps=real_soundfile(**kwargs))
+            wrapped.write.side_effect = OSError('write failed')
+            return wrapped
+        self._feed_blocks(_SILENCE, 0.4)
+        played = self._play(0, 1.0)
+        with mock.patch('soundfile.SoundFile', side_effect=writer), self.assertLogs(level='ERROR'):
+            self._start(self._reported(played))
+            self.worker.join(timeout=2)
+        self.assertFalse(self.worker.is_alive())
+        self.assertTrue(any(kind == 'error' and 'write failed' in error
+                            for kind, _, error in list(self.status.queue)))
 
 
 if __name__ == '__main__':
