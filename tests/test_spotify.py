@@ -33,6 +33,16 @@ class MakePlaybackTests(unittest.TestCase):
         self.assertEqual(item["album"]["release_date"], "0000")
         self.assertEqual(item["album"]["images"], [{"url": "http://x/y.jpg"}])
 
+    def test_comma_decimal_coercion(self):
+        pb = make_playback(
+            is_playing=True, progress_ms="12345,6", track_id="abc",
+            name="Song", duration_ms="200000,0", track_number="7,0",
+            artists=["A"], album_name="Alb",
+        )
+        self.assertEqual(pb["progress_ms"], 12345)
+        self.assertEqual(pb["item"]["duration_ms"], 200000)
+        self.assertEqual(pb["item"]["track_number"], 7)
+
     def test_defaults_when_empty(self):
         pb = make_playback(
             is_playing=False, progress_ms=None, track_id="", name="",
@@ -71,6 +81,19 @@ class AppleScriptParseTests(unittest.TestCase):
         self.assertEqual(item["track_number"], 11)
         self.assertEqual(item["duration_ms"], 354320)
         self.assertEqual(item["album"]["images"][0]["url"], "https://i.scdn.co/image/abc123")
+
+    def test_parses_playing_track_with_comma_decimal_separator(self):
+        # On German/European macOS locales, AppleScript coerces floats with a comma (e.g. "42,5")
+        payload = _SEP.join([
+            "spotify:track:6rqhFgbbKwnb9MLmUQDhG6",
+            "Bohemian Rhapsody", "Queen", "A Night at the Opera",
+            "11", "354320", "42,5", "playing",
+            "https://i.scdn.co/image/abc123", "END",
+        ])
+        pb = self._source_returning(payload).get_playback()
+        self.assertIsNotNone(pb)
+        self.assertTrue(pb["is_playing"])
+        self.assertEqual(pb["progress_ms"], 42500)
 
     def test_paused_track_with_empty_art_still_returns_dict(self):
         # Trailing empty art field + "END" sentinel: parser must not lose fields.

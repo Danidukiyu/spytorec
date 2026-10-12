@@ -60,6 +60,8 @@ def make_playback(*, is_playing: bool, progress_ms, track_id: str, name: str,
     """
     def _int(value, default: int = 0) -> int:
         try:
+            if isinstance(value, str):
+                value = value.strip().replace(",", ".")
             return int(float(value))
         except (TypeError, ValueError):
             return default

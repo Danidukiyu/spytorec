@@ -84,8 +84,9 @@ class AppleScriptSource(TrackSource):
         track_id = raw_id.rsplit(":", 1)[-1] if raw_id else ""
 
         try:
-            progress_ms = int(float(position_s) * 1000)
-        except (TypeError, ValueError):
+            clean_pos = position_s.strip().replace(",", ".") if isinstance(position_s, str) else position_s
+            progress_ms = int(float(clean_pos) * 1000)
+        except (TypeError, ValueError, AttributeError):
             progress_ms = 0
 
         return make_playback(
