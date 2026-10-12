@@ -21,14 +21,14 @@ from typing import Dict, Optional
 from spytorec.spotify.base import TrackSource, make_playback
 
 try:
-    from winsdk.windows.media.control import (
+    from winrt.windows.media.control import (
         GlobalSystemMediaTransportControlsSessionManager as _SessionManager,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus as _PlaybackStatus,
     )
-    from winsdk.windows.storage.streams import Buffer, DataReader, InputStreamOptions
-    _WINSDK_AVAILABLE = True
+    from winrt.windows.storage.streams import Buffer, DataReader, InputStreamOptions
+    _WINRT_AVAILABLE = True
 except ImportError:
-    _WINSDK_AVAILABLE = False
+    _WINRT_AVAILABLE = False
 
 # Matches both the Microsoft Store AUMID (SpotifyAB.SpotifyMusic_...!Spotify)
 # and the plain Win32 install, which tends to report just "Spotify.exe".
@@ -49,9 +49,9 @@ class SmtcSource(TrackSource):
         self._art_urls: Dict[str, Optional[str]] = {}
 
     def connect(self) -> None:
-        if not _WINSDK_AVAILABLE:
+        if not _WINRT_AVAILABLE:
             raise RuntimeError(
-                "winsdk is not installed, or this isn't Windows (pip install winsdk)"
+                "the winrt packages are not installed, or this isn't Windows"
             )
         # One loop for the source's lifetime; asyncio.run() per poll wastes
         # work and fails if the caller already has a running loop.
@@ -67,7 +67,7 @@ class SmtcSource(TrackSource):
 
     @staticmethod
     async def _request_manager():
-        # winsdk's *_async() returns an IAsyncOperation, not a coroutine: await
+        # WinRT's *_async() returns an IAsyncOperation, not a coroutine: await
         # it inside an async def, don't hand it to run_until_complete().
         return await _SessionManager.request_async()
 
