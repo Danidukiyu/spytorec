@@ -1,10 +1,31 @@
 """Own the active recording and the audio process across track changes."""
 
 import logging
+import logging.handlers
 import time
 import uuid
 
 from spytorec import audio_process as audio, state
+
+
+def audio_log_spec():
+    """The parent's file-logging setup, restated for a spawned child.
+
+    Spawned children start with no handlers and no configuration; without
+    this, capture errors and shutdown notes would be lost from the log.
+    """
+    root = logging.getLogger()
+    spec = {'enabled': False}
+    handler = next((h for h in root.handlers
+                    if isinstance(h, logging.handlers.RotatingFileHandler)), None)
+    if handler is not None:
+        spec = {
+            'enabled': True,
+            'path': handler.baseFilename,
+            'max_bytes': handler.maxBytes,
+            'level': logging.getLevelName(root.level),
+        }
+    return spec
 
 
 def effective_output_format(requested):
@@ -34,7 +55,7 @@ class RecordingSession:
         self.path = None
 
     def start_pipeline(self):
-        audio.start_audio_process(**self.audio_settings)
+        audio.start_audio_process(**self.audio_settings, log_spec=audio_log_spec())
         state.last_heartbeat = time.time()
 
     def start_track(self, track, bit_depth, lead_ms):
