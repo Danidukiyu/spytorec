@@ -12,6 +12,11 @@ Communication:
 
 Every captured block goes through a BoundaryTracker, which opens each
 recording on the track's first beat (see boundary.py).
+
+The child is spawned, never forked: the main process imports soundcard
+(device validation, hardware wizard) and so holds a libpulse connection
+whose mainloop thread cannot survive a fork — libpulse aborts in the
+child on first use.
 """
 
 import time
@@ -25,14 +30,33 @@ import numpy as np
 
 from spytorec.boundary import BLOCKSIZE, BoundaryTracker
 
+
+def _worker_logging(spec):
+    """Restore file logging in a spawned child; handlers are not inherited."""
+    if not spec or not spec.get('enabled'):
+        return
+    from logging.handlers import RotatingFileHandler
+
+    handler = RotatingFileHandler(spec['path'], maxBytes=spec['max_bytes'],
+                                  backupCount=2, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, spec['level'], logging.INFO))
+    for old in logger.handlers[:]:
+        logger.removeHandler(old)
+    logger.addHandler(handler)
+
+
 def _audio_worker(control_q: mp.Queue, meter_q: mp.Queue, event_q: mp.Queue,
                   mic_id: str, sr: int, ch: int, smooth_meter: bool,
-                  mic_name: str = None, boundary: dict = None, status_q=None):
+                  mic_name: str = None, boundary: dict = None, status_q=None,
+                  log_spec=None):
     """Child process entry point. Captures WASAPI audio and encodes to FLAC.
     
     This function runs in its own process with its own GIL, so it is never
     affected by Python-level activity in the main process (UI, Spotify, etc).
     """
+    _worker_logging(log_spec)
     # Import heavy audio libraries inside the child process only
     warnings.filterwarnings("ignore", module="soundcard")
     writer = None  # sf.SoundFile or None
@@ -274,25 +298,30 @@ def _wait_status(kind, request_id=None, timeout=5.0):
 
 
 def start_audio_process(mic_id: str, sr: int, ch: int, smooth_meter: bool = True,
-                        mic_name: str = None, boundary: dict = None):
+                        mic_name: str = None, boundary: dict = None, log_spec=None):
     """Spawn the isolated audio child process.
     `mic_name` finds the device should `mic_id` no longer (see find_device).
     `boundary` holds the BoundaryTracker settings (see boundary.settings_from_config).
+    `log_spec` restores the parent's file logging in the spawned child.
     """
     global _audio_proc, _control_q, _meter_q, _event_q, _status_q
 
     if _audio_proc is not None:
         shutdown_audio_process()
 
-    _control_q = mp.Queue(maxsize=10)
-    _meter_q = mp.Queue(maxsize=5)
-    _event_q = mp.Queue(maxsize=50)
-    _status_q = mp.Queue()
+    # A forked child would inherit the parent's libpulse connection without
+    # its mainloop thread and abort on first use (pa_operation_unref).
+    ctx = mp.get_context('spawn')
 
-    _audio_proc = mp.Process(
+    _control_q = ctx.Queue(maxsize=10)
+    _meter_q = ctx.Queue(maxsize=5)
+    _event_q = ctx.Queue(maxsize=50)
+    _status_q = ctx.Queue()
+
+    _audio_proc = ctx.Process(
         target=_audio_worker,
         args=(_control_q, _meter_q, _event_q, mic_id, sr, ch, smooth_meter,
-              mic_name, boundary, _status_q),
+              mic_name, boundary, _status_q, log_spec),
         daemon=True
     )
     try:
